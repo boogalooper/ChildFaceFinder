@@ -1,4 +1,4 @@
-# Child Face Finder
+﻿# Child Face Finder
 
 Windows-утилита для поиска детей на больших наборах фотографий по одному или нескольким эталонным изображениям каждого ребёнка.
 
@@ -198,19 +198,18 @@ portable/
 │  ├─ README_PORTABLE.md
 │  ├─ app/
 │  ├─ models/
-│  ├─ python/
-│  └─ runtime/
-│     └─ site-packages/
+│  └─ python/
+│     └─ Lib/site-packages/
 └─ ChildFaceFinder_Portable.zip
 ```
 
-Portable не является копией `venv`: виртуальные окружения Windows содержат привязку к исходному Python и не предназначены для простого переноса. Вместо этого сборщик копирует управляемый CPython, отдельно копирует проверенные `site-packages`, приложение и модели. При portable-запуске приложение подключает `runtime\site-packages` через `site.addsitedir()`, поэтому `.pth`-файлы пакетов также обрабатываются.
+Portable не является копией `venv`: виртуальные окружения Windows содержат привязку к исходному Python и не предназначены для простого переноса. Сборщик копирует управляемый CPython, а проверенные зависимости помещает непосредственно в штатный `python\Lib\site-packages` portable-Python. Поэтому portable запускается обычной командой `python\python.exe app\app.py`, без привязки к исходному пути `venv`, без `runpy` и без дополнительного bootstrap-кода.
 
 На целевом Windows x64 компьютере для portable **не требуется** устанавливать Python, `uv`, `venv`, CUDA Toolkit или cuDNN. CUDA/cuDNN user-mode библиотеки из Python-пакетов входят в portable. Для GPU-режима всё равно нужны совместимая NVIDIA-видеокарта и достаточно свежий NVIDIA-драйвер — драйвер в portable не включается.
 
 Перед созданием ZIP сборщик запускает из portable-копии те же проверки Python/Tkinter/CUDA и smoke-test InsightFace + `antelopev2`. Если portable-проверка не прошла, обычная установленная версия не изменяется.
 
-Portable создаётся в обычной видимой папке `portable`; никаких Hidden/System атрибутов сборщик не назначает. Папку `ChildFaceFinder_Portable` можно переносить целиком или распаковать созданный ZIP на другом компьютере. Нельзя переносить только `run.bat` отдельно от `app`, `python`, `runtime` и `models`.
+Portable создаётся в обычной видимой папке `portable`; никаких Hidden/System атрибутов сборщик не назначает. Папку `ChildFaceFinder_Portable` можно переносить целиком или распаковать созданный ZIP на другом компьютере. Нельзя переносить только `run.bat` отдельно от `app`, `python` и `models`.
 
 ## Рекомендуемые настройки первого запуска
 

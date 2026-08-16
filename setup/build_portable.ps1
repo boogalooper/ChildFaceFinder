@@ -42,6 +42,15 @@ function Copy-DirectoryContents {
     }
 }
 
+function Remove-PortableArtifacts {
+    if (Test-Path -LiteralPath $PortableDir) {
+        Remove-Item -LiteralPath $PortableDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $PortableZip) {
+        Remove-Item -LiteralPath $PortableZip -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host '============================================================'
 Write-Host 'Child Face Finder - portable builder'
 Write-Host 'Creates a self-contained Windows x64 folder and ZIP.'
@@ -86,12 +95,7 @@ try {
 
     Write-Host '[2/7] Preparing portable folder...'
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
-    if (Test-Path -LiteralPath $PortableDir) {
-        Remove-Item -LiteralPath $PortableDir -Recurse -Force
-    }
-    if (Test-Path -LiteralPath $PortableZip) {
-        Remove-Item -LiteralPath $PortableZip -Force
-    }
+    Remove-PortableArtifacts
     New-Item -ItemType Directory -Path $PortableDir -Force | Out-Null
 
     Write-Host '[3/7] Copying application, models and managed Python...'
@@ -108,9 +112,13 @@ try {
         throw 'Portable pythonw.exe was not copied as expected.'
     }
 
-    Write-Host '[4/7] Copying installed third-party packages...'
-    $PortableRuntime = Join-Path $PortableDir 'runtime'
-    $PortableSitePackages = Join-Path $PortableRuntime 'site-packages'
+    Write-Host '[4/7] Installing packages into portable Python layout...'
+    # Do NOT copy a Windows venv itself: its pyvenv.cfg and launchers are tied to
+    # the original installation path. Instead, copy the verified venv packages
+    # into the normal site-packages directory of the copied managed CPython.
+    # Then ordinary "python.exe app\app.py" works without any bootstrap/runpy hack.
+    $PortableSitePackages = Join-Path $PortableDir 'python\Lib\site-packages'
+    New-Item -ItemType Directory -Path $PortableSitePackages -Force | Out-Null
     Copy-DirectoryContents -Source $VenvSitePackages -Destination $PortableSitePackages
 
     # Keep the portable folder clean and avoid bytecode containing old venv paths.
@@ -164,11 +172,13 @@ exit /b %RC%
 
 Запуск: `run.bat`. Для диагностики используйте `run_console.bat` — консоль останется открытой и покажет ошибки/журнал запуска.
 
-На целевом компьютере НЕ требуется отдельно устанавливать Python, uv, venv, CUDA Toolkit или cuDNN. Управляемый Python и нужные CUDA/cuDNN user-mode библиотеки уже находятся внутри portable.
+На целевом компьютере НЕ требуется отдельно устанавливать Python, uv, venv, CUDA Toolkit или cuDNN. Управляемый Python и нужные Python/CUDA/cuDNN user-mode библиотеки уже находятся внутри portable.
 
 Для ускорения на NVIDIA всё равно нужны совместимая видеокарта NVIDIA и достаточно свежий драйвер NVIDIA. Драйвер в portable не включается. Если в интерфейсе включено «Требовать NVIDIA CUDA», а CUDAExecutionProvider не запускается, программа выдаст ошибку вместо скрытого перехода на CPU.
 
-Переносите папку `ChildFaceFinder_Portable` целиком. Нельзя отделять `run.bat` от папок `app`, `python`, `runtime` и `models`.
+Переносите папку `ChildFaceFinder_Portable` целиком. Нельзя отделять `run.bat` от папок `app`, `python` и `models`.
+
+Зависимости установлены непосредственно в `python\Lib\site-packages`, поэтому portable не зависит от абсолютного пути исходного `venv` и запускается обычным portable Python без специального bootstrap-кода.
 
 Временные изображения при необходимости создаются только в системной папке TEMP операционной системы. Используется та же логика штатной очистки и удаления остатков предыдущих аварийных запусков, что и в обычной версии.
 '@
@@ -181,19 +191,18 @@ exit /b %RC%
     Write-Host '[6/7] Validating portable runtime and GPU...'
     $OldNoUserSite = $env:PYTHONNOUSERSITE
     $OldNoBytecode = $env:PYTHONDONTWRITEBYTECODE
-    $OldPortableSite = $env:CFF_PORTABLE_SITE
     try {
         $env:PYTHONNOUSERSITE = '1'
         $env:PYTHONDONTWRITEBYTECODE = '1'
-        $env:CFF_PORTABLE_SITE = $PortableSitePackages
-        $Bootstrap = 'import os,site,runpy,sys; site.addsitedir(os.environ["CFF_PORTABLE_SITE"]); sys.path.insert(0, os.path.dirname(sys.argv[1])); runpy.run_path(sys.argv[1], run_name="__main__")'
-        Invoke-Native $PortablePython '-c' $Bootstrap (Join-Path $PortableDir 'app\check_install.py')
-        Invoke-Native $PortablePython '-c' $Bootstrap (Join-Path $PortableDir 'app\smoke_gpu.py')
+
+        # Run scripts exactly the same way the portable launchers will run them.
+        # This catches path/import problems before the ZIP is created.
+        Invoke-Native $PortablePython (Join-Path $PortableDir 'app\check_install.py')
+        Invoke-Native $PortablePython (Join-Path $PortableDir 'app\smoke_gpu.py')
     }
     finally {
         $env:PYTHONNOUSERSITE = $OldNoUserSite
         $env:PYTHONDONTWRITEBYTECODE = $OldNoBytecode
-        $env:CFF_PORTABLE_SITE = $OldPortableSite
     }
 
     Write-Host '[7/7] Creating ZIP archive...'
@@ -218,6 +227,8 @@ catch {
     Write-Host '============================================================' -ForegroundColor Red
     Write-Host 'PORTABLE BUILD FAILED' -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host 'Removing incomplete portable output...' -ForegroundColor Yellow
+    Remove-PortableArtifacts
     Write-Host 'The normal installed version was not modified.' -ForegroundColor Yellow
     Write-Host '============================================================' -ForegroundColor Red
     exit 1
