@@ -58,6 +58,10 @@ class Settings:
     require_gpu: bool = True
     verbose_diagnostics: bool = True
 
+    write_result_csv: bool = True
+    write_rejected_csv: bool = True
+    write_review_csv: bool = True
+
     reference_min_det_score: float = 0.45
     reference_consistency_warn: float = 0.55
 
@@ -101,9 +105,9 @@ class RunSummary:
     matched_pairs: int
     rejected_pairs: int
     review_rows: int
-    output_csv: Path
-    rejected_csv: Path
-    review_csv: Path
+    output_csv: Path | None
+    rejected_csv: Path | None
+    review_csv: Path | None
 
 
 class CancelledError(RuntimeError):
@@ -995,23 +999,36 @@ class ChildFaceFinder:
                 )
             ]
 
-            rejected_csv = output_csv.with_name(output_csv.stem + "_rejected.csv")
-            review_csv = output_csv.with_name(output_csv.stem + "_review.csv")
-            self._write_csv_atomic(
-                output_csv,
-                ["Идентификатор ребенка", "номер фото с этим ребенком"],
-                match_rows,
-            )
-            self._write_csv_atomic(
-                rejected_csv,
-                ["Идентификатор ребенка", "номер фото", "Причина", "Cosine distance"],
-                rejected_rows,
-            )
-            self._write_csv_atomic(
-                review_csv,
-                ["номер фото", "Лучший кандидат", "Distance", "Второй кандидат", "Distance 2", "Причина"],
-                reviews,
-            )
+            rejected_csv_path = output_csv.with_name(output_csv.stem + "_rejected.csv")
+            review_csv_path = output_csv.with_name(output_csv.stem + "_review.csv")
+
+            written_output_csv: Path | None = None
+            written_rejected_csv: Path | None = None
+            written_review_csv: Path | None = None
+
+            if self.settings.write_result_csv:
+                self._write_csv_atomic(
+                    output_csv,
+                    ["Идентификатор ребенка", "номер фото с этим ребенком"],
+                    match_rows,
+                )
+                written_output_csv = output_csv
+
+            if self.settings.write_rejected_csv:
+                self._write_csv_atomic(
+                    rejected_csv_path,
+                    ["Идентификатор ребенка", "номер фото", "Причина", "Cosine distance"],
+                    rejected_rows,
+                )
+                written_rejected_csv = rejected_csv_path
+
+            if self.settings.write_review_csv:
+                self._write_csv_atomic(
+                    review_csv_path,
+                    ["номер фото", "Лучший кандидат", "Distance", "Второй кандидат", "Distance 2", "Причина"],
+                    reviews,
+                )
+                written_review_csv = review_csv_path
 
         return RunSummary(
             reference_ids=len(references.child_ids),
@@ -1020,7 +1037,7 @@ class ChildFaceFinder:
             matched_pairs=len(match_rows),
             rejected_pairs=len(rejected_rows),
             review_rows=len(reviews),
-            output_csv=output_csv,
-            rejected_csv=rejected_csv,
-            review_csv=review_csv,
+            output_csv=written_output_csv,
+            rejected_csv=written_rejected_csv,
+            review_csv=written_review_csv,
         )

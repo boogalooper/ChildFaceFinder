@@ -72,10 +72,17 @@ def _safe_extract(zip_path: Path, dest: Path) -> None:
         zf.extractall(dest)
 
 
-def ensure_antelopev2(force: bool = False) -> Path:
+def ensure_antelopev2(force: bool = False, allow_download: bool = False) -> Path:
     if model_is_valid() and not force:
         print(f"Модель уже установлена: {MODEL_DIR}")
         return MODEL_DIR
+
+    if not allow_download:
+        raise RuntimeError(
+            "Модель antelopev2 не найдена или повреждена. Обычный запуск работает полностью офлайн "
+            "и не загружает модели автоматически. Восстановите папку models\\insightface\\models\\antelopev2 "
+            "из резервной/portable-копии либо запустите install.bat при наличии интернета."
+        )
 
     MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
 
@@ -115,9 +122,14 @@ def ensure_antelopev2(force: bool = False) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="явно разрешить загрузку antelopev2 из интернета",
+    )
     args = parser.parse_args()
     try:
-        ensure_antelopev2(force=args.force)
+        ensure_antelopev2(force=args.force, allow_download=args.download or args.force)
         return 0
     except Exception as exc:
         print(f"ОШИБКА: {exc}", file=sys.stderr)

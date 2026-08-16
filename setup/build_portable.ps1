@@ -11,22 +11,8 @@ $OutputRoot = Join-Path $ProjectDir 'portable'
 $PortableDir = Join-Path $OutputRoot 'ChildFaceFinder_Portable'
 $PortableZip = Join-Path $OutputRoot 'ChildFaceFinder_Portable.zip'
 $UvExe = Join-Path $ProjectDir 'tools\uv\uv.exe'
-$ExpectedDistributions = @(
-    'insightface',
-    'onnxruntime-gpu',
-    'nvidia-cudnn-cu12',
-    'numpy',
-    'onnx',
-    'opencv-python-headless',
-    'scipy',
-    'scikit-image',
-    'tqdm',
-    'requests',
-    'Pillow',
-    'pillow-heif',
-    'rawpy'
-)
-
+$Requirements = Join-Path $SetupDir 'requirements.txt'
+$env:UV_NO_CONFIG = '1'
 function Invoke-Native {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -56,25 +42,6 @@ function Copy-DirectoryContents {
     Get-ChildItem -LiteralPath $Source -Force | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $Destination -Recurse -Force
     }
-}
-
-function Copy-DistributionMetadata {
-    param(
-        [Parameter(Mandatory = $true)][string]$DistributionName,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-
-    # Query metadata through the verified venv itself. This is important for
-    # InsightFace because it is installed separately with --no-deps and its
-    # distribution metadata must be preserved in portable as well.
-    $Code = "from importlib import metadata; print(metadata.distribution('$DistributionName')._path)"
-    $MetadataPath = [string]((& $VenvPython -c $Code 2>$null | Select-Object -First 1))
-    $MetadataPath = $MetadataPath.Trim()
-    if (-not $MetadataPath -or -not (Test-Path -LiteralPath $MetadataPath)) {
-        throw "Could not locate distribution metadata for $DistributionName in the installed environment."
-    }
-
-    Copy-Item -LiteralPath $MetadataPath -Destination $Destination -Recurse -Force
 }
 
 function Remove-PortableArtifacts {
@@ -122,14 +89,12 @@ try {
         throw "The venv base Python is outside tools\python and will not be packaged: $BaseDirResolved"
     }
 
-    $VenvSitePackages = [string]((& $VenvPython -c 'import site; print(site.getsitepackages()[0])' 2>$null | Select-Object -First 1))
-    $VenvSitePackages = $VenvSitePackages.Trim()
-    if (-not $VenvSitePackages -or -not (Test-Path -LiteralPath $VenvSitePackages -PathType Container)) {
-        throw 'Could not locate venv site-packages.'
+    if (-not (Test-Path -LiteralPath $Requirements -PathType Leaf)) {
+        throw 'setup\requirements.txt not found.'
     }
 
     Write-Host "Managed Python: $BasePythonDir"
-    Write-Host "Packages:       $VenvSitePackages"
+    Write-Host "Requirements:   $Requirements"
 
     Write-Host '[2/7] Preparing portable folder...'
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
@@ -150,21 +115,22 @@ try {
         throw 'Portable pythonw.exe was not copied as expected.'
     }
 
-    Write-Host '[4/7] Installing packages into portable Python layout...'
-    # Do NOT copy a Windows venv itself: its pyvenv.cfg and launchers are tied to
-    # the original installation path. Instead, copy the verified venv packages
-    # into the normal site-packages directory of the copied managed CPython.
-    # Launchers explicitly point PYTHONPATH at the copied site-packages; no runpy/bootstrap is used.
+    Write-Host '[4/7] Installing packages into portable site-packages...'
     $PortableSitePackages = Join-Path $PortableDir 'python\Lib\site-packages'
     New-Item -ItemType Directory -Path $PortableSitePackages -Force | Out-Null
-    Copy-DirectoryContents -Source $VenvSitePackages -Destination $PortableSitePackages
 
-    # Copy distribution metadata explicitly. The bulk copy above normally includes
-    # *.dist-info, but an explicitly installed package (notably InsightFace) can
-    # have metadata resolved from a different sys.path entry. Query the verified
-    # venv for every pinned distribution and copy its metadata into portable.
-    foreach ($DistributionName in $ExpectedDistributions) {
-        Copy-DistributionMetadata -DistributionName $DistributionName -Destination $PortableSitePackages
+    # The copied uv-managed CPython intentionally carries an EXTERNALLY-MANAGED
+    # marker. Do not modify that interpreter as an environment. Instead, use
+    # uv's supported --target mode to lay out the resolved wheels directly in
+    # the portable Python's own Lib\site-packages directory. --python still
+    # selects the copied CPython 3.11 interpreter for wheel/ABI resolution.
+    # This avoids --break-system-packages and preserves native wheel payloads
+    # such as cv2 .pyd files and ONNX Runtime / CUDA DLL directories.
+    Invoke-Native $UvExe 'pip' 'install' '--python' $PortablePython '--target' $PortableSitePackages '-r' $Requirements
+    Invoke-Native $UvExe 'pip' 'install' '--python' $PortablePython '--target' $PortableSitePackages '--no-deps' 'insightface==1.0.1'
+
+    if (-not (Test-Path -LiteralPath $PortableSitePackages -PathType Container)) {
+        throw 'Portable site-packages was not created as expected.'
     }
 
     # Keep the portable folder clean and avoid bytecode containing old venv paths.
@@ -226,7 +192,7 @@ exit /b %RC%
 
 Переносите папку `ChildFaceFinder_Portable` целиком. Нельзя отделять `run.bat` от папок `app`, `python` и `models`.
 
-Зависимости и их `*.dist-info` metadata находятся в `python\Lib\site-packages`. Launchers явно добавляют эту локальную папку через `PYTHONPATH`, поэтому portable не зависит от абсолютного пути исходного `venv` и не использует специальный Python/bootstrap-скрипт.
+Зависимости устанавливаются через поддерживаемый режим `uv --target` непосредственно в `python\Lib\site-packages` переносимого Python из тех же закреплённых requirements, что и обычная установка. Это сохраняет полный wheel-layout нативных пакетов (`cv2`, ONNX Runtime, rawpy и DLL). Launchers также явно задают локальный `PYTHONPATH`; portable не зависит от исходного пути `venv`.
 
 Временные изображения при необходимости создаются только в системной папке TEMP операционной системы. Используется та же логика штатной очистки и удаления остатков предыдущих аварийных запусков, что и в обычной версии.
 '@
@@ -245,16 +211,13 @@ exit /b %RC%
         $env:PYTHONDONTWRITEBYTECODE = '1'
         $env:PYTHONPATH = $PortableSitePackages
 
-        # Verify that the portable interpreter sees every pinned distribution
-        # before running the broader install/GPU checks.
-        foreach ($DistributionName in $ExpectedDistributions) {
-            $Code = "from importlib import metadata; print(metadata.version('$DistributionName'))"
-            Invoke-Native $PortablePython '-c' $Code
-        }
-
-        # Run scripts exactly the same way the portable launchers will run them.
-        # This catches path/import problems before the ZIP is created.
+        # check_install.py already validates pinned distribution metadata,
+        # imports all key native packages (including cv2/rawpy/onnxruntime),
+        # Tkinter and CUDAExecutionProvider. Running a real .py file avoids
+        # fragile PowerShell/CMD quoting of Python -c code.
         Invoke-Native $PortablePython (Join-Path $PortableDir 'app\check_install.py')
+
+        # Final end-to-end InsightFace + antelopev2 + CUDA smoke-test.
         Invoke-Native $PortablePython (Join-Path $PortableDir 'app\smoke_gpu.py')
     }
     finally {
