@@ -203,11 +203,11 @@ portable/
 └─ ChildFaceFinder_Portable.zip
 ```
 
-Portable не является копией `venv`: виртуальные окружения Windows содержат привязку к исходному Python и не предназначены для простого переноса. Сборщик копирует управляемый CPython, а проверенные зависимости помещает непосредственно в штатный `python\Lib\site-packages` portable-Python. Поэтому portable запускается обычной командой `python\python.exe app\app.py`, без привязки к исходному пути `venv`, без `runpy` и без дополнительного bootstrap-кода.
+Portable не является копией `venv`: виртуальные окружения Windows содержат привязку к исходному Python и не предназначены для простого переноса. Сборщик копирует управляемый CPython, а проверенные зависимости и их `*.dist-info` metadata помещает в `python\Lib\site-packages`. `run.bat` и `run_console.bat` явно задают локальный `PYTHONPATH` на эту папку, поэтому portable не зависит от исходного пути `venv` и не использует `runpy` или отдельный bootstrap-скрипт.
 
 На целевом Windows x64 компьютере для portable **не требуется** устанавливать Python, `uv`, `venv`, CUDA Toolkit или cuDNN. CUDA/cuDNN user-mode библиотеки из Python-пакетов входят в portable. Для GPU-режима всё равно нужны совместимая NVIDIA-видеокарта и достаточно свежий NVIDIA-драйвер — драйвер в portable не включается.
 
-Перед созданием ZIP сборщик запускает из portable-копии те же проверки Python/Tkinter/CUDA и smoke-test InsightFace + `antelopev2`. Если portable-проверка не прошла, обычная установленная версия не изменяется.
+Перед созданием ZIP сборщик отдельно проверяет, что portable-Python видит metadata каждой закреплённой distribution (`insightface`, ONNX Runtime GPU, CUDA/cuDNN и остальные зависимости), затем запускает те же проверки Python/Tkinter/CUDA и smoke-test InsightFace + `antelopev2`. Если portable-проверка не прошла, обычная установленная версия не изменяется.
 
 Portable создаётся в обычной видимой папке `portable`; никаких Hidden/System атрибутов сборщик не назначает. Папку `ChildFaceFinder_Portable` можно переносить целиком или распаковать созданный ZIP на другом компьютере. Нельзя переносить только `run.bat` отдельно от `app`, `python` и `models`.
 

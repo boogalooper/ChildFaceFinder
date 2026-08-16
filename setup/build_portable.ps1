@@ -10,6 +10,22 @@ $ManagedPythonRoot = Join-Path $ProjectDir 'tools\python'
 $OutputRoot = Join-Path $ProjectDir 'portable'
 $PortableDir = Join-Path $OutputRoot 'ChildFaceFinder_Portable'
 $PortableZip = Join-Path $OutputRoot 'ChildFaceFinder_Portable.zip'
+$UvExe = Join-Path $ProjectDir 'tools\uv\uv.exe'
+$ExpectedDistributions = @(
+    'insightface',
+    'onnxruntime-gpu',
+    'nvidia-cudnn-cu12',
+    'numpy',
+    'onnx',
+    'opencv-python-headless',
+    'scipy',
+    'scikit-image',
+    'tqdm',
+    'requests',
+    'Pillow',
+    'pillow-heif',
+    'rawpy'
+)
 
 function Invoke-Native {
     param(
@@ -42,6 +58,25 @@ function Copy-DirectoryContents {
     }
 }
 
+function Copy-DistributionMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string]$DistributionName,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    # Query metadata through the verified venv itself. This is important for
+    # InsightFace because it is installed separately with --no-deps and its
+    # distribution metadata must be preserved in portable as well.
+    $Code = "from importlib import metadata; print(metadata.distribution('$DistributionName')._path)"
+    $MetadataPath = [string]((& $VenvPython -c $Code 2>$null | Select-Object -First 1))
+    $MetadataPath = $MetadataPath.Trim()
+    if (-not $MetadataPath -or -not (Test-Path -LiteralPath $MetadataPath)) {
+        throw "Could not locate distribution metadata for $DistributionName in the installed environment."
+    }
+
+    Copy-Item -LiteralPath $MetadataPath -Destination $Destination -Recurse -Force
+}
+
 function Remove-PortableArtifacts {
     if (Test-Path -LiteralPath $PortableDir) {
         Remove-Item -LiteralPath $PortableDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -62,6 +97,9 @@ Write-Host
 try {
     if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
         throw 'Installed environment not found. Run install.bat successfully before building portable.'
+    }
+    if (-not (Test-Path -LiteralPath $UvExe -PathType Leaf)) {
+        throw 'Local uv executable not found. Run install.bat successfully before building portable.'
     }
     if (-not (Test-Path -LiteralPath $ModelsDir -PathType Container)) {
         throw 'Models folder not found. Run install.bat successfully before building portable.'
@@ -116,10 +154,18 @@ try {
     # Do NOT copy a Windows venv itself: its pyvenv.cfg and launchers are tied to
     # the original installation path. Instead, copy the verified venv packages
     # into the normal site-packages directory of the copied managed CPython.
-    # Then ordinary "python.exe app\app.py" works without any bootstrap/runpy hack.
+    # Launchers explicitly point PYTHONPATH at the copied site-packages; no runpy/bootstrap is used.
     $PortableSitePackages = Join-Path $PortableDir 'python\Lib\site-packages'
     New-Item -ItemType Directory -Path $PortableSitePackages -Force | Out-Null
     Copy-DirectoryContents -Source $VenvSitePackages -Destination $PortableSitePackages
+
+    # Copy distribution metadata explicitly. The bulk copy above normally includes
+    # *.dist-info, but an explicitly installed package (notably InsightFace) can
+    # have metadata resolved from a different sys.path entry. Query the verified
+    # venv for every pinned distribution and copy its metadata into portable.
+    foreach ($DistributionName in $ExpectedDistributions) {
+        Copy-DistributionMetadata -DistributionName $DistributionName -Destination $PortableSitePackages
+    }
 
     # Keep the portable folder clean and avoid bytecode containing old venv paths.
     foreach ($CleanRoot in @((Join-Path $PortableDir 'app'), $PortableSitePackages)) {
@@ -136,6 +182,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 set "PYTHONNOUSERSITE=1"
 set "PYTHONDONTWRITEBYTECODE=1"
+set "PYTHONPATH=%~dp0python\Lib\site-packages"
 if not exist "python\pythonw.exe" (
     echo Portable Python runtime not found.
     pause
@@ -152,6 +199,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 set "PYTHONNOUSERSITE=1"
 set "PYTHONDONTWRITEBYTECODE=1"
+set "PYTHONPATH=%~dp0python\Lib\site-packages"
 if not exist "python\python.exe" (
     echo Portable Python runtime not found.
     pause
@@ -178,7 +226,7 @@ exit /b %RC%
 
 Переносите папку `ChildFaceFinder_Portable` целиком. Нельзя отделять `run.bat` от папок `app`, `python` и `models`.
 
-Зависимости установлены непосредственно в `python\Lib\site-packages`, поэтому portable не зависит от абсолютного пути исходного `venv` и запускается обычным portable Python без специального bootstrap-кода.
+Зависимости и их `*.dist-info` metadata находятся в `python\Lib\site-packages`. Launchers явно добавляют эту локальную папку через `PYTHONPATH`, поэтому portable не зависит от абсолютного пути исходного `venv` и не использует специальный Python/bootstrap-скрипт.
 
 Временные изображения при необходимости создаются только в системной папке TEMP операционной системы. Используется та же логика штатной очистки и удаления остатков предыдущих аварийных запусков, что и в обычной версии.
 '@
@@ -191,9 +239,18 @@ exit /b %RC%
     Write-Host '[6/7] Validating portable runtime and GPU...'
     $OldNoUserSite = $env:PYTHONNOUSERSITE
     $OldNoBytecode = $env:PYTHONDONTWRITEBYTECODE
+    $OldPythonPath = $env:PYTHONPATH
     try {
         $env:PYTHONNOUSERSITE = '1'
         $env:PYTHONDONTWRITEBYTECODE = '1'
+        $env:PYTHONPATH = $PortableSitePackages
+
+        # Verify that the portable interpreter sees every pinned distribution
+        # before running the broader install/GPU checks.
+        foreach ($DistributionName in $ExpectedDistributions) {
+            $Code = "from importlib import metadata; print(metadata.version('$DistributionName'))"
+            Invoke-Native $PortablePython '-c' $Code
+        }
 
         # Run scripts exactly the same way the portable launchers will run them.
         # This catches path/import problems before the ZIP is created.
@@ -203,6 +260,7 @@ exit /b %RC%
     finally {
         $env:PYTHONNOUSERSITE = $OldNoUserSite
         $env:PYTHONDONTWRITEBYTECODE = $OldNoBytecode
+        $env:PYTHONPATH = $OldPythonPath
     }
 
     Write-Host '[7/7] Creating ZIP archive...'
