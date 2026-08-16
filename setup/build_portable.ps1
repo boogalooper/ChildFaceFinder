@@ -64,30 +64,72 @@ try {
     }
 
     Write-Host '[1/6] Locating managed CPython and installed packages...'
-    $BasePythonExe = [string]((& $VenvPython -c 'import sys; print(sys._base_executable)' 2>$null | Select-Object -First 1))
-    $BasePythonExe = $BasePythonExe.Trim()
-    if (-not $BasePythonExe -or -not (Test-Path -LiteralPath $BasePythonExe -PathType Leaf)) {
-        throw 'Could not locate the managed base Python used by the venv.'
-    }
-    $BasePythonDir = Split-Path -Parent $BasePythonExe
 
+    # This project is Windows-only and creates the venv itself, so use its fixed
+    # Windows layout directly. Do not execute venv Python just to discover paths:
+    # that made portable creation depend on interpreter startup before copying.
+    $VenvDir = Join-Path $ProjectDir 'venv'
+    $VenvConfig = Join-Path $VenvDir 'pyvenv.cfg'
+    $VenvSitePackages = Join-Path $VenvDir 'Lib\site-packages'
+
+    if (-not (Test-Path -LiteralPath $VenvConfig -PathType Leaf)) {
+        throw "venv\pyvenv.cfg was not found: $VenvConfig"
+    }
+    if (-not (Test-Path -LiteralPath $VenvSitePackages -PathType Container)) {
+        throw "venv\Lib\site-packages was not found: $VenvSitePackages"
+    }
     if (-not (Test-Path -LiteralPath $ManagedPythonRoot -PathType Container)) {
         throw 'Managed Python folder tools\python was not found.'
     }
+
+    # uv-created venv records the base interpreter directory in pyvenv.cfg as
+    # "home = ...". Prefer that exact value. If it is absent for any reason,
+    # fall back to the single managed python.exe under tools\python.
+    $BasePythonDir = $null
+    $HomeLine = Get-Content -LiteralPath $VenvConfig -ErrorAction Stop |
+        Where-Object { $_ -match '^\s*home\s*=' } |
+        Select-Object -First 1
+    if ($null -ne $HomeLine -and $HomeLine -match '^\s*home\s*=\s*(.+?)\s*$') {
+        $CandidateHome = $Matches[1].Trim().Trim('"')
+        if (Test-Path -LiteralPath (Join-Path $CandidateHome 'python.exe') -PathType Leaf) {
+            $BasePythonDir = $CandidateHome
+        }
+    }
+
+    if (-not $BasePythonDir) {
+        $Candidates = @(
+            Get-ChildItem -LiteralPath $ManagedPythonRoot -File -Filter 'python.exe' -Recurse -ErrorAction Stop |
+                Where-Object {
+                    (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'Lib') -PathType Container) -and
+                    (Test-Path -LiteralPath (Join-Path $_.Directory.FullName 'DLLs') -PathType Container)
+                }
+        )
+        if ($Candidates.Count -ne 1) {
+            throw "Could not uniquely locate managed CPython under tools\python (found $($Candidates.Count) candidates)."
+        }
+        $BasePythonDir = $Candidates[0].Directory.FullName
+    }
+
     $ManagedRootResolved = (Resolve-Path -LiteralPath $ManagedPythonRoot).Path.TrimEnd('\')
     $BaseDirResolved = (Resolve-Path -LiteralPath $BasePythonDir).Path.TrimEnd('\')
-    if (-not $BaseDirResolved.StartsWith($ManagedRootResolved + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not ($BaseDirResolved.Equals($ManagedRootResolved, [System.StringComparison]::OrdinalIgnoreCase) -or
+              $BaseDirResolved.StartsWith($ManagedRootResolved + '\', [System.StringComparison]::OrdinalIgnoreCase))) {
         throw "The venv base Python is outside tools\python and will not be packaged: $BaseDirResolved"
     }
 
-    $VenvSitePackages = [string]((& $VenvPython -c 'import site; print(site.getsitepackages()[0])' 2>$null | Select-Object -First 1))
-    $VenvSitePackages = $VenvSitePackages.Trim()
-    if (-not $VenvSitePackages -or -not (Test-Path -LiteralPath $VenvSitePackages -PathType Container)) {
-        throw 'Could not locate venv site-packages.'
+    $BasePythonExe = Join-Path $BaseDirResolved 'python.exe'
+    if (-not (Test-Path -LiteralPath $BasePythonExe -PathType Leaf)) {
+        throw "Managed python.exe was not found: $BasePythonExe"
     }
 
-    Write-Host "Managed Python: $BasePythonDir"
+    $InsightFaceMetadata = Get-ChildItem -LiteralPath $VenvSitePackages -Directory -Filter 'insightface-*.dist-info' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $InsightFaceMetadata) {
+        throw "InsightFace package metadata was not found in the source site-packages: $VenvSitePackages"
+    }
+
+    Write-Host "Managed Python: $BaseDirResolved"
     Write-Host "Packages:       $VenvSitePackages"
+    Write-Host "InsightFace metadata: $($InsightFaceMetadata.Name)"
 
     Write-Host '[2/6] Preparing portable folder...'
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
@@ -116,6 +158,14 @@ try {
     $PortableSitePackages = Join-Path $PortableDir 'python\Lib\site-packages'
     New-Item -ItemType Directory -Path $PortableSitePackages -Force | Out-Null
     Copy-DirectoryContents -Source $VenvSitePackages -Destination $PortableSitePackages
+
+    $PortableInsightFaceMetadata = Get-ChildItem -LiteralPath $PortableSitePackages -Directory -Filter 'insightface-*.dist-info' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $PortableInsightFaceMetadata) {
+        throw 'InsightFace package metadata was not copied into portable Python site-packages.'
+    }
+    if (Test-Path -LiteralPath (Join-Path $PortableSitePackages 'Lib\site-packages')) {
+        throw 'Portable packages were copied from the wrong source level (nested Lib\site-packages detected).'
+    }
 
     # Keep the portable folder clean and avoid bytecode containing old venv paths.
     foreach ($CleanRoot in @((Join-Path $PortableDir 'app'), $PortableSitePackages)) {
@@ -216,7 +266,10 @@ catch {
     Write-Host
     Write-Host '============================================================' -ForegroundColor Red
     Write-Host 'PORTABLE BUILD FAILED' -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host $_.Exception.ToString() -ForegroundColor Red
+    if ($_.ScriptStackTrace) {
+        Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
+    }
     Write-Host 'Removing incomplete portable output...' -ForegroundColor Yellow
     Remove-PortableArtifacts
     Write-Host 'The normal installed version was not modified.' -ForegroundColor Yellow
