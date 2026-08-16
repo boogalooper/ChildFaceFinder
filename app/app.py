@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import os
 import queue
+import site
 import threading
 import traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+# Portable builds keep third-party packages outside the bundled CPython tree.
+# addsitedir() also processes any .pth files, unlike a plain PYTHONPATH entry.
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+_PORTABLE_SITE_PACKAGES = _PROJECT_DIR / "runtime" / "site-packages"
+if _PORTABLE_SITE_PACKAGES.is_dir():
+    site.addsitedir(str(_PORTABLE_SITE_PACKAGES))
 
 from engine import CancelledError, ChildFaceFinder, RunSummary, Settings
 from image_loader import cleanup_stale_temp_dirs

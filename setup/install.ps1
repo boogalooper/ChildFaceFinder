@@ -135,4 +135,21 @@ finally {
     }
 }
 
+if ($ExitCode -eq 0) {
+    Write-Host
+    $PortableAnswer = Read-Host 'Собрать portable-версию сейчас? [y/N]'
+    if ($PortableAnswer -match '^(?i:y|yes|д|да)$') {
+        Write-Host
+        & (Join-Path $SetupDir 'build_portable.ps1')
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host
+            Write-Host 'Portable build failed, but the normal installation is valid.' -ForegroundColor Yellow
+            Write-Host 'Можно повторить сборку позже через setup\build_portable.bat.' -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host 'Portable-сборка пропущена. Позже её можно создать через setup\build_portable.bat.'
+    }
+}
+
 exit $ExitCode

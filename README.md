@@ -13,6 +13,7 @@ Windows-утилита для поиска детей на больших наб
 - Каждый критерий качества можно включить/выключить в GUI. Включённый критерий исключает пару ребёнок–фото из основного CSV и записывает её в `*_rejected.csv`.
 - RAW обрабатывается быстрым путём: сначала используется встроенный JPEG-preview камеры, при необходимости — `rawpy` half-size fallback; промежуточный JPEG для RAW на диск не пишется. HEIC/HEIF/AVIF и редкие форматы при необходимости используют только системный `%TEMP%`, а временные файлы удаляются сразу.
 - В корне проекта находятся только `run.bat`, `install.bat` и `README.md`. Остальные файлы лежат в обычных видимых папках `app` и `setup`; после установки также создаются обычные видимые `tools`, `venv`, `models`. Скрытые/системные каталоги не используются.
+- После обычной установки можно опционально собрать автономную portable-папку и ZIP; на целевой машине не нужен установленный Python/CUDA Toolkit, но для GPU остаётся нужен совместимый NVIDIA-драйвер.
 
 ## Структура проекта
 
@@ -32,6 +33,8 @@ ChildFaceFinder/
 │  └─ smoke_gpu.py
 └─ setup/
    ├─ install.ps1
+   ├─ build_portable.ps1
+   ├─ build_portable.bat
    ├─ requirements.txt
    └─ run_console.bat
 ```
@@ -177,8 +180,37 @@ RAW читается через `rawpy` / LibRaw: CR2, CR3, NEF, ARW, DNG, RAF, 
 6. Проверятся Tkinter и CUDA Execution Provider.
 7. `antelopev2` будет установлен в `models/insightface/models/antelopev2`.
 8. Выполнится GPU/model smoke-test.
+9. После успешной установки установщик спросит, нужно ли сразу собрать portable-версию. Ответ `N`/Enter ничего дополнительного не создаёт.
 
 После успешной установки запускайте `run.bat`. Для диагностики с консолью можно запустить `setup\run_console.bat`.
+
+## Portable-сборка
+
+Portable создаётся **опционально после обычной успешной установки**. Её можно собрать сразу, ответив `Y` на вопрос в конце `install.bat`, либо позже запустить `setup\build_portable.bat`.
+
+Сборщик использует уже установленную и проверенную конфигурацию и создаёт:
+
+```text
+portable/
+├─ ChildFaceFinder_Portable/
+│  ├─ run.bat
+│  ├─ run_console.bat
+│  ├─ README_PORTABLE.md
+│  ├─ app/
+│  ├─ models/
+│  ├─ python/
+│  └─ runtime/
+│     └─ site-packages/
+└─ ChildFaceFinder_Portable.zip
+```
+
+Portable не является копией `venv`: виртуальные окружения Windows содержат привязку к исходному Python и не предназначены для простого переноса. Вместо этого сборщик копирует управляемый CPython, отдельно копирует проверенные `site-packages`, приложение и модели. При portable-запуске приложение подключает `runtime\site-packages` через `site.addsitedir()`, поэтому `.pth`-файлы пакетов также обрабатываются.
+
+На целевом Windows x64 компьютере для portable **не требуется** устанавливать Python, `uv`, `venv`, CUDA Toolkit или cuDNN. CUDA/cuDNN user-mode библиотеки из Python-пакетов входят в portable. Для GPU-режима всё равно нужны совместимая NVIDIA-видеокарта и достаточно свежий NVIDIA-драйвер — драйвер в portable не включается.
+
+Перед созданием ZIP сборщик запускает из portable-копии те же проверки Python/Tkinter/CUDA и smoke-test InsightFace + `antelopev2`. Если portable-проверка не прошла, обычная установленная версия не изменяется.
+
+Portable создаётся в обычной видимой папке `portable`; никаких Hidden/System атрибутов сборщик не назначает. Папку `ChildFaceFinder_Portable` можно переносить целиком или распаковать созданный ZIP на другом компьютере. Нельзя переносить только `run.bat` отдельно от `app`, `python`, `runtime` и `models`.
 
 ## Рекомендуемые настройки первого запуска
 
