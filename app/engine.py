@@ -23,7 +23,8 @@ cv2.setNumThreads(1)
 
 RIGHT_EYE_106 = slice(33, 43)
 LEFT_EYE_106 = slice(87, 97)
-CYRILLIC_REFERENCE_WORD = re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*")
+LEADING_REFERENCE_NUMBER = re.compile(r"^\s*\d+\s+(.+?)\s*$")
+LEADING_REFERENCE_LETTER = re.compile(r"^\s*[A-Z]\s+(.+?)\s*$")
 
 
 @dataclass(slots=True)
@@ -175,29 +176,26 @@ def _normalized_identity_key(name: str) -> str:
 
 def parse_reference_identifier(path: Path) -> str:
     """
-    Извлекает ID ребёнка только из кириллических слов basename.
+    Возвращает имя из basename, не учитывая каталог и необязательный
+    ведущий числовой или односимвольный латинский индекс:
 
-    Цифровые и латинские индексы камеры автоматически игнорируются:
-    'IMGP3656 Кравченко Роман 3658.tif' -> 'Кравченко Роман'
-    'DSC09708 Абысов Станислав 02.jpg'  -> 'Абысов Станислав'
-    '712 Котов Никита.jpg'              -> 'Котов Никита'
+    '712 Котов Никита.jpg' -> 'Котов Никита'
+    'A Котов Никита.jpg'   -> 'Котов Никита'
+    'Котов Никита.jpg'     -> 'Котов Никита'
+    'Smith John.jpg'       -> 'Smith John'
+    'портрет/Котов.jpg'    -> 'Котов'
 
-    Короткие (1–3 символа) слова, написанные полностью заглавными буквами,
-    считаются служебными метками и удаляются: 'Львов Артём БА' -> 'Львов Артём'.
-    Обычные короткие имена ('Лев', 'Ян', 'Ия') сохраняются. Дефис внутри
-    кириллического слова поддерживается. Подкаталоги никогда не входят в ID.
+    Латиница в обычной части имени сохраняется полностью. Удаляется только
+    отдельная ведущая заглавная латинская буква A-Z, используемая как индекс.
+    Подкаталоги никогда не входят в ID ребёнка.
     """
-    stem = unicodedata.normalize("NFKC", path.stem)
-    words = CYRILLIC_REFERENCE_WORD.findall(stem)
-
-    filtered: list[str] = []
-    for word in words:
-        letters_only = word.replace("-", "")
-        if len(letters_only) <= 3 and letters_only.isupper():
-            continue
-        filtered.append(word)
-
-    return " ".join(filtered)
+    stem = unicodedata.normalize("NFKC", path.stem).strip()
+    match = LEADING_REFERENCE_NUMBER.match(stem)
+    if not match:
+        match = LEADING_REFERENCE_LETTER.match(stem)
+    if match:
+        stem = match.group(1).strip()
+    return " ".join(stem.split())
 
 
 def _identity_tokens(name: str) -> tuple[list[str], list[str]]:
