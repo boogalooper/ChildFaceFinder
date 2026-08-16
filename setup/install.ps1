@@ -106,7 +106,7 @@ try {
     Invoke-Native $PythonExe (Join-Path $AppDir 'check_install.py')
 
     Write-Host '[6/7] Downloading/verifying InsightFace antelopev2...'
-    Invoke-Native $PythonExe (Join-Path $AppDir 'model_setup.py') '--download'
+    Invoke-Native $PythonExe (Join-Path $AppDir 'model_setup.py')
 
     Write-Host '[7/7] Running GPU/model smoke test...'
     Invoke-Native $PythonExe (Join-Path $AppDir 'smoke_gpu.py')

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-import json
 import os
 import queue
+import site
 import threading
 import traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+# Portable builds keep third-party packages outside the bundled CPython tree.
+# addsitedir() also processes any .pth files, unlike a plain PYTHONPATH entry.
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
-_DATA_DIR = _PROJECT_DIR / "data"
-_SESSION_FILE = _DATA_DIR / "last_session.json"
-_SESSION_SCHEMA_VERSION = 1
+_PORTABLE_SITE_PACKAGES = _PROJECT_DIR / "runtime" / "site-packages"
+if _PORTABLE_SITE_PACKAGES.is_dir():
+    site.addsitedir(str(_PORTABLE_SITE_PACKAGES))
 
 from engine import CancelledError, ChildFaceFinder, RunSummary, Settings
 from image_loader import cleanup_stale_temp_dirs
@@ -125,8 +127,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1000x920")
-        self.minsize(900, 780)
+        self.geometry("1000x850")
+        self.minsize(900, 720)
 
         self.events: queue.Queue[tuple] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -155,14 +157,9 @@ class App(tk.Tk):
         self.require_gpu_var = tk.BooleanVar(value=True)
         self.verbose_var = tk.BooleanVar(value=True)
 
-        self.create_result_var = tk.BooleanVar(value=True)
-        self.create_rejected_var = tk.BooleanVar(value=True)
-        self.create_review_var = tk.BooleanVar(value=True)
-
         self.status_var = tk.StringVar(value="Готово к запуску")
         self.progress_var = tk.DoubleVar(value=0.0)
 
-        self._load_session_settings()
         self._build_ui()
         removed_temp, failed_temp = cleanup_stale_temp_dirs()
         if removed_temp:
@@ -176,7 +173,7 @@ class App(tk.Tk):
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(10, weight=1)
+        outer.rowconfigure(9, weight=1)
 
         ttk.Label(outer, text="Эталонные изображения детей:").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(outer, textvariable=self.ref_var).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
@@ -186,7 +183,7 @@ class App(tk.Tk):
         ttk.Entry(outer, textvariable=self.photos_var).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
         ttk.Button(outer, text="Обзор…", command=self._browse_photos).grid(row=1, column=2, pady=4)
 
-        ttk.Label(outer, text="CSV / базовое имя результатов:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(outer, text="CSV результата:").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(outer, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", padx=8, pady=4)
         ttk.Button(outer, text="Обзор…", command=self._browse_output).grid(row=2, column=2, pady=4)
 
@@ -344,31 +341,8 @@ class App(tk.Tk):
         c3.grid(row=1, column=4, columnspan=4, sticky="w", pady=3)
         add_tooltip(c3, "Показывает в журнале: сколько лиц найдено полным кадром, сколько добавили тайлы, сколько осталось после NMS, сколько принято/отбраковано/отправлено на проверку.")
 
-        outputs = ttk.LabelFrame(outer, text="Создаваемые CSV", padding=10)
-        outputs.grid(row=7, column=0, columnspan=3, sticky="ew", pady=6)
-        for col in range(3):
-            outputs.columnconfigure(col, weight=1)
-
-        o1 = ttk.Checkbutton(outputs, text="Основной result.csv", variable=self.create_result_var)
-        o1.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=3)
-        add_tooltip(o1, "Создавать основной CSV с успешно распознанными детьми и номерами фотографий. Если выключено, основной файл не создаётся и не перезаписывается.")
-
-        o2 = ttk.Checkbutton(outputs, text="Отбракованные *_rejected.csv", variable=self.create_rejected_var)
-        o2.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=3)
-        add_tooltip(o2, "Создавать CSV с распознанными детьми, исключёнными включёнными фильтрами качества: закрытые глаза, смаз, поворот, размер лица или экспозиция. Если выключено, файл не создаётся и не перезаписывается.")
-
-        o3 = ttk.Checkbutton(outputs, text="Сомнительные *_review.csv", variable=self.create_review_var)
-        o3.grid(row=0, column=2, sticky="w", pady=3)
-        add_tooltip(o3, "Создавать CSV с неуверенными совпадениями: лицо близко к порогу или отрыв от второго ребёнка слишком мал. Если выключено, файл не создаётся и не перезаписывается.")
-
-        ttk.Label(
-            outputs,
-            text="Должен быть включён хотя бы один CSV. Выбранный выше путь используется как базовое имя и для *_rejected.csv / *_review.csv.",
-            wraplength=930,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(5, 0))
-
         buttons = ttk.Frame(outer)
-        buttons.grid(row=8, column=0, columnspan=3, sticky="ew", pady=4)
+        buttons.grid(row=7, column=0, columnspan=3, sticky="ew", pady=4)
         self.start_btn = ttk.Button(buttons, text="Начать", command=self._start)
         self.start_btn.pack(side="left")
         self.cancel_btn = ttk.Button(buttons, text="Отмена", command=self._cancel, state="disabled")
@@ -376,10 +350,10 @@ class App(tk.Tk):
         ttk.Label(buttons, textvariable=self.status_var).pack(side="left", padx=12)
 
         self.progress = ttk.Progressbar(outer, variable=self.progress_var, maximum=100.0)
-        self.progress.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+        self.progress.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(6, 8))
 
         log_frame = ttk.LabelFrame(outer, text="Журнал", padding=5)
-        log_frame.grid(row=10, column=0, columnspan=3, sticky="nsew")
+        log_frame.grid(row=9, column=0, columnspan=3, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled")
@@ -392,111 +366,7 @@ class App(tk.Tk):
             outer,
             text="Предобученные модели InsightFace имеют отдельные лицензионные ограничения; см. README.md.",
             wraplength=950,
-        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(7, 0))
-
-    def _session_state(self) -> dict[str, object]:
-        return {
-            "schema_version": _SESSION_SCHEMA_VERSION,
-            "references_path": self.ref_var.get(),
-            "photos_path": self.photos_var.get(),
-            "output_path": self.output_var.get(),
-            "search_mode": self.search_mode_var.get(),
-            "detector_threshold": self.detector_threshold_var.get(),
-            "quality_preset": self.quality_preset_var.get(),
-            "match_threshold": self.threshold_var.get(),
-            "ambiguity_margin": self.margin_var.get(),
-            "reject_closed_eyes": self.closed_eyes_var.get(),
-            "reject_blur": self.blur_var.get(),
-            "reject_pose": self.pose_var.get(),
-            "reject_small_face": self.small_face_var.get(),
-            "reject_exposure": self.exposure_var.get(),
-            "decode_workers": int(self.decode_workers_var.get()),
-            "inference_workers": int(self.inference_workers_var.get()),
-            "recursive": self.recursive_var.get(),
-            "require_gpu": self.require_gpu_var.get(),
-            "verbose_diagnostics": self.verbose_var.get(),
-            "create_result_csv": self.create_result_var.get(),
-            "create_rejected_csv": self.create_rejected_var.get(),
-            "create_review_csv": self.create_review_var.get(),
-        }
-
-    def _save_session_settings(self) -> None:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(self._session_state(), ensure_ascii=False, indent=2) + "\n"
-        temp_path = _SESSION_FILE.with_suffix(".json.tmp")
-        try:
-            temp_path.write_text(payload, encoding="utf-8")
-            os.replace(temp_path, _SESSION_FILE)
-        finally:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    def _load_session_settings(self) -> None:
-        if not _SESSION_FILE.is_file():
-            return
-        try:
-            data = json.loads(_SESSION_FILE.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or data.get("schema_version") != _SESSION_SCHEMA_VERSION:
-                return
-
-            def set_string(key: str, var: tk.StringVar) -> None:
-                value = data.get(key)
-                if isinstance(value, str):
-                    var.set(value)
-
-            def set_float_text(key: str, var: tk.StringVar, low: float, high: float) -> None:
-                value = data.get(key)
-                if not isinstance(value, str):
-                    return
-                try:
-                    number = float(value.replace(",", "."))
-                except ValueError:
-                    return
-                if low <= number <= high:
-                    var.set(value)
-
-            def set_bool(key: str, var: tk.BooleanVar) -> None:
-                value = data.get(key)
-                if isinstance(value, bool):
-                    var.set(value)
-
-            def set_int(key: str, var: tk.IntVar, low: int, high: int) -> None:
-                value = data.get(key)
-                if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
-                    var.set(value)
-
-            set_string("references_path", self.ref_var)
-            set_string("photos_path", self.photos_var)
-            set_string("output_path", self.output_var)
-
-            search_mode = data.get("search_mode")
-            if search_mode in SEARCH_MODES:
-                self.search_mode_var.set(search_mode)
-            quality_preset = data.get("quality_preset")
-            if quality_preset in QUALITY_PRESETS:
-                self.quality_preset_var.set(quality_preset)
-
-            set_float_text("detector_threshold", self.detector_threshold_var, 0.05, 0.8)
-            set_float_text("match_threshold", self.threshold_var, 0.05, 1.0)
-            set_float_text("ambiguity_margin", self.margin_var, 0.0, 0.5)
-            set_bool("reject_closed_eyes", self.closed_eyes_var)
-            set_bool("reject_blur", self.blur_var)
-            set_bool("reject_pose", self.pose_var)
-            set_bool("reject_small_face", self.small_face_var)
-            set_bool("reject_exposure", self.exposure_var)
-            set_int("decode_workers", self.decode_workers_var, 1, 32)
-            set_int("inference_workers", self.inference_workers_var, 1, 8)
-            set_bool("recursive", self.recursive_var)
-            set_bool("require_gpu", self.require_gpu_var)
-            set_bool("verbose_diagnostics", self.verbose_var)
-            set_bool("create_result_csv", self.create_result_var)
-            set_bool("create_rejected_csv", self.create_rejected_var)
-            set_bool("create_review_csv", self.create_review_var)
-        except Exception:
-            # Повреждённый или устаревший конфиг не должен мешать запуску GUI.
-            return
+        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(7, 0))
 
     def _browse_refs(self) -> None:
         value = filedialog.askdirectory(title="Папка с эталонами")
@@ -537,8 +407,6 @@ class App(tk.Tk):
         return number
 
     def _make_settings(self) -> Settings:
-        if not (self.create_result_var.get() or self.create_rejected_var.get() or self.create_review_var.get()):
-            raise ValueError("Выберите хотя бы один создаваемый CSV")
         quality = QUALITY_PRESETS[self.quality_preset_var.get()]
         search = SEARCH_MODES[self.search_mode_var.get()]
         return Settings(
@@ -566,9 +434,6 @@ class App(tk.Tk):
             recursive=self.recursive_var.get(),
             require_gpu=self.require_gpu_var.get(),
             verbose_diagnostics=self.verbose_var.get(),
-            write_result_csv=self.create_result_var.get(),
-            write_rejected_csv=self.create_rejected_var.get(),
-            write_review_csv=self.create_review_var.get(),
         )
 
     def _validate_paths(self) -> tuple[Path, Path, Path]:
@@ -580,7 +445,7 @@ class App(tk.Tk):
         if not photos_text:
             raise ValueError("Укажите папку фотографий")
         if not output_text:
-            raise ValueError("Укажите путь / базовое имя CSV")
+            raise ValueError("Укажите CSV результата")
         refs = Path(ref_text).expanduser()
         photos = Path(photos_text).expanduser()
         output = Path(output_text).expanduser()
@@ -599,7 +464,6 @@ class App(tk.Tk):
         try:
             refs, photos, output = self._validate_paths()
             settings = self._make_settings()
-            self._save_session_settings()
         except Exception as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
             return
@@ -669,16 +533,12 @@ class App(tk.Tk):
                     )
                     self._finish_ui()
                     if not self.closing_after_cancel:
-                        created_files: list[str] = []
-                        if summary.output_csv is not None:
-                            created_files.append(f"Основной CSV:\n{summary.output_csv}")
-                        if summary.rejected_csv is not None:
-                            created_files.append(f"Отбракованные:\n{summary.rejected_csv}")
-                        if summary.review_csv is not None:
-                            created_files.append(f"Сомнительные совпадения:\n{summary.review_csv}")
                         messagebox.showinfo(
                             APP_TITLE,
-                            "Обработка завершена.\n\n" + "\n\n".join(created_files),
+                            "Обработка завершена.\n\n"
+                            f"Основной CSV:\n{summary.output_csv}\n\n"
+                            f"Отбракованные:\n{summary.rejected_csv}\n\n"
+                            f"Сомнительные совпадения:\n{summary.review_csv}",
                             parent=self,
                         )
                 elif kind == "cancelled":
@@ -698,10 +558,6 @@ class App(tk.Tk):
             self.after(100, self._poll_events)
 
     def _on_close(self) -> None:
-        try:
-            self._save_session_settings()
-        except Exception:
-            pass
         if self.worker and self.worker.is_alive():
             self.closing_after_cancel = True
             self._cancel()
