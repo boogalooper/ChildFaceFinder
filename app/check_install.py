@@ -8,6 +8,12 @@ from importlib import metadata
 EXPECTED = {
     "insightface": "1.0.1",
     "onnxruntime-gpu": "1.26.0",
+    "nvidia-cuda-nvrtc-cu12": "12.8.61",
+    "nvidia-cuda-runtime-cu12": "12.8.57",
+    "nvidia-cublas-cu12": "12.8.3.14",
+    "nvidia-cufft-cu12": "11.3.3.41",
+    "nvidia-curand-cu12": "10.3.9.55",
+    "nvidia-nvjitlink-cu12": "12.8.61",
     "nvidia-cudnn-cu12": "9.7.1.26",
     "numpy": "1.26.4",
     "onnx": "1.18.0",
@@ -78,13 +84,29 @@ def main() -> int:
     import scipy
     import skimage
     import insightface
-    import onnxruntime as ort
+    try:
+        import onnxruntime as ort
+    except Exception as exc:
+        raise RuntimeError(
+            "Не удалось загрузить ONNX Runtime. На Windows это часто означает "
+            "отсутствующий/повреждённый Microsoft Visual C++ 2015-2022 x64 "
+            "Redistributable. Установите его и повторите install.bat. "
+            f"Исходная ошибка: {exc}"
+        ) from exc
 
     # ORT умеет загрузить CUDA/cuDNN DLL из nvidia-* wheel-пакетов,
     # CUDA-библиотеки ставятся extra [cuda], а cuDNN закреплён отдельным пакетом.
-    if hasattr(ort, "preload_dlls"):
-        ort.preload_dlls(directory="")
-    providers = ort.get_available_providers()
+    try:
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls(directory="")
+        providers = ort.get_available_providers()
+    except Exception as exc:
+        raise RuntimeError(
+            "ONNX Runtime установлен, но не удалось загрузить его CUDA/cuDNN DLL. "
+            "Проверьте Microsoft Visual C++ 2015-2022 x64 Redistributable и "
+            "драйвер NVIDIA. Отдельный CUDA Toolkit для этого проекта не нужен. "
+            f"Исходная ошибка: {exc}"
+        ) from exc
     print("ONNX Runtime:", ort.__version__)
     print("cuDNN wheel:", metadata.version("nvidia-cudnn-cu12"))
     print("Providers:", providers)

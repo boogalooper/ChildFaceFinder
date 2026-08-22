@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import math
 import os
@@ -18,6 +19,7 @@ import numpy as np
 
 from image_loader import cleanup_stale_temp_dirs, decode_image, iter_candidate_files, make_system_temp_dir
 from model_setup import INSIGHTFACE_ROOT, MODEL_NAME, ensure_antelopev2
+from series_selector import BestFrameCandidate, select_best_series_frames
 
 cv2.setNumThreads(1)
 
@@ -32,6 +34,9 @@ class Settings:
     match_threshold: float = 0.45
     ambiguity_margin: float = 0.04
     detector_threshold: float = 0.18
+    rescue_detector_threshold: float = 0.10
+    rescue_max_candidates: int = 80
+    recognition_batch_size: int = 64
 
     min_face_px: int = 45
     max_yaw: float = 45.0
@@ -46,6 +51,19 @@ class Settings:
     reject_pose: bool = True
     reject_small_face: bool = True
     reject_exposure: bool = False
+    reject_head_clipping: bool = True
+    head_top_margin_ratio: float = 0.18
+    head_side_margin_ratio: float = 0.07
+    chin_margin_ratio: float = 0.03
+
+    # Дополнительная композиционная зона у реальной границы кадра.
+    # Она масштабируется по доле кадра, занимаемой bbox лица: маленькому лицу
+    # требуется больший относительный отступ, крупному портрету — меньший.
+    edge_guard_base_ratio: float = 0.020
+    edge_guard_min_ratio: float = 0.008
+    edge_guard_max_ratio: float = 0.050
+    edge_guard_reference_face_area: float = 0.015
+    edge_guard_size_exponent: float = 0.50
 
     tile_enabled: bool = True
     tile_size: int = 2200
@@ -59,14 +77,28 @@ class Settings:
     require_gpu: bool = True
     verbose_diagnostics: bool = True
 
+    select_best_series: bool = False
+    series_max_gap_seconds: float = 12.0
+    series_max_filename_gap: int = 5
+
     reference_min_det_score: float = 0.45
     reference_consistency_warn: float = 0.55
+
+
+@dataclass(slots=True)
+class FaceCandidate:
+    bbox: tuple[int, int, int, int]
+    raw_bbox: tuple[float, float, float, float]
+    kps: np.ndarray
+    det_score: float
+    source: str = "full"
 
 
 @dataclass(slots=True)
 class FaceRecord:
     embedding: np.ndarray
     bbox: tuple[int, int, int, int]
+    raw_bbox: tuple[float, float, float, float]
     det_score: float
     quality_reasons: list[str] = field(default_factory=list)
     blur_score: float | None = None
@@ -88,9 +120,9 @@ class ImageAnalysis:
 
 @dataclass(slots=True)
 class ReferenceSet:
-    child_ids: list[str]
+    person_ids: list[str]
     matrix: np.ndarray
-    ref_child_indices: np.ndarray
+    ref_person_indices: np.ndarray
     file_count: int
 
 
@@ -105,6 +137,8 @@ class RunSummary:
     output_csv: Path
     rejected_csv: Path
     review_csv: Path
+    best_csv: Path | None = None
+    best_series_count: int = 0
 
 
 class CancelledError(RuntimeError):
@@ -187,7 +221,7 @@ def parse_reference_identifier(path: Path) -> str:
 
     Латиница в обычной части имени сохраняется полностью. Удаляется только
     отдельная ведущая заглавная латинская буква A-Z, используемая как индекс.
-    Подкаталоги никогда не входят в ID ребёнка.
+    Подкаталоги никогда не входят в ID цели.
     """
     stem = unicodedata.normalize("NFKC", path.stem).strip()
     match = LEADING_REFERENCE_NUMBER.match(stem)
@@ -267,20 +301,20 @@ def _contains_identity_sequence(name: str, sequence_key: str) -> bool:
 
 def group_reference_paths(paths: list[Path]) -> list[tuple[str, list[Path]]]:
     """
-    Группирует любое количество эталонов одного ребёнка.
+    Группирует любое количество эталонов одного цели.
 
     1. Все точные нормализованные basename объединяются без ограничения количества.
     2. Различающиеся имена могут объединяться по однозначной общей части из двух
        и более слов (например, «Котов Никита портрет/стоя/улица»).
     3. Однословная общая часть разрешается только для однозначной пары, например
-       «Котов» + «Котов Никита». Если «Котов» подходит сразу к нескольким детям,
+       «Котов» + «Котов Никита». Если «Котов» подходит сразу к нескольким людям,
        программа не угадывает.
     """
     exact: dict[str, list[tuple[Path, str]]] = defaultdict(list)
     for path in paths:
         display = parse_reference_identifier(path)
         if not display:
-            raise RuntimeError(f"Не удалось получить ID ребёнка из имени: {path.name}")
+            raise RuntimeError(f"Не удалось получить ID цели из имени: {path.name}")
         exact[_normalized_identity_key(display)].append((path, display))
 
     # Каждый точный нормализованный ID становится узлом. Внутри узла уже может
@@ -325,7 +359,7 @@ def group_reference_paths(paths: list[Path]) -> list[tuple[str, list[Path]]]:
                 if _contains_identity_sequence(name, key):
                     names.add(name)
         raise RuntimeError(
-            "Неоднозначные имена эталонов: короткая общая часть подходит сразу к нескольким детям. "
+            "Неоднозначные имена эталонов: короткая общая часть подходит сразу к нескольким людям. "
             "Уточните имена файлов: " + ", ".join(sorted(names, key=str.casefold))
         )
 
@@ -399,7 +433,7 @@ def _bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> flo
     return float(inter / (area_a + area_b - inter))
 
 
-def _nms_records(records: list[FaceRecord], threshold: float) -> list[FaceRecord]:
+def _nms_records(records: list[FaceRecord | FaceCandidate], threshold: float) -> list[FaceRecord | FaceCandidate]:
     if len(records) <= 1:
         return records
     # Сначала оставляем наиболее уверенный bbox. При равном score отдаём
@@ -409,7 +443,7 @@ def _nms_records(records: list[FaceRecord], threshold: float) -> list[FaceRecord
         key=lambda r: (r.det_score, (r.bbox[2] - r.bbox[0]) * (r.bbox[3] - r.bbox[1])),
         reverse=True,
     )
-    kept: list[FaceRecord] = []
+    kept: list[FaceRecord | FaceCandidate] = []
     for record in ordered:
         if all(_bbox_iou(record.bbox, old.bbox) < threshold for old in kept):
             kept.append(record)
@@ -422,7 +456,11 @@ class FaceEngine:
         self.settings = settings
         self.log = log or (lambda _: None)
         self.analyzer = None
+        self.detector = None
+        self.recognition_model = None
+        self.landmark_models: list[object] = []
         self.provider = ""
+        self._thread_state = threading.local()
 
     def initialize(self) -> None:
         self.log("Проверка модели antelopev2...")
@@ -457,15 +495,29 @@ class FaceEngine:
             allowed_modules=allowed,
             providers=providers,
         )
+        # SCRFD запускается с более низким внутренним rescue-порогом. Обычный
+        # пользовательский detector_threshold применяется уже к кандидатам.
+        # Это позволяет сохранить слабые маленькие лица без второго прохода GPU.
+        internal_threshold = min(self.settings.detector_threshold, self.settings.rescue_detector_threshold)
         self.analyzer.prepare(
             ctx_id=0 if has_cuda else -1,
-            det_thresh=self.settings.detector_threshold,
+            det_thresh=internal_threshold,
             det_size=(640, 640),
         )
 
+        self.detector = getattr(self.analyzer, "det_model", None)
+        models = getattr(self.analyzer, "models", {})
+        self.recognition_model = models.get("recognition")
+        self.landmark_models = [
+            model for name, model in models.items()
+            if name in {"landmark_2d_106", "landmark_3d_68"}
+        ]
+        if self.detector is None or self.recognition_model is None:
+            raise RuntimeError("В antelopev2 не найдены обязательные detection/recognition модели")
+
         if has_cuda:
             bad_sessions: list[str] = []
-            for name, model in getattr(self.analyzer, "models", {}).items():
+            for name, model in models.items():
                 session = getattr(model, "session", None)
                 if session is not None and "CUDAExecutionProvider" not in session.get_providers():
                     bad_sessions.append(name)
@@ -474,42 +526,188 @@ class FaceEngine:
 
         self.log("Прогрев моделей...")
         dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        # Один полный вызов при инициализации допустим: он прогревает все сессии.
+        # В рабочем цикле FaceAnalysis.get() больше не используется на тайлах.
         self.analyzer.get(dummy)
-        for name, model in getattr(self.analyzer, "models", {}).items():
-            if name == "detection":
+        self.log("Модели готовы: detection -> NMS -> batch recognition -> landmarks.")
+
+    def _get_thread_detector(self):
+        if self.detector is None:
+            raise RuntimeError("FaceEngine не инициализирован")
+        detector = getattr(self._thread_state, "detector", None)
+        if detector is None:
+            # SCRFD хранит изменяемый center_cache в Python-wrapper. Делаем
+            # отдельный wrapper на inference-поток, но оставляем общую ORT Session.
+            detector = copy.copy(self.detector)
+            detector.center_cache = dict(getattr(self.detector, "center_cache", {}))
+            detector.det_thresh = min(self.settings.detector_threshold, self.settings.rescue_detector_threshold)
+            self._thread_state.detector = detector
+        return detector
+
+    @staticmethod
+    def _clip_bbox(
+        raw_bbox: tuple[float, float, float, float], image_w: int, image_h: int
+    ) -> tuple[int, int, int, int] | None:
+        rx1, ry1, rx2, ry2 = raw_bbox
+        if not np.isfinite([rx1, ry1, rx2, ry2]).all():
+            return None
+        x1 = max(0, min(image_w - 1, int(round(rx1))))
+        y1 = max(0, min(image_h - 1, int(round(ry1))))
+        x2 = max(x1 + 1, min(image_w, int(round(rx2))))
+        y2 = max(y1 + 1, min(image_h, int(round(ry2))))
+        return x1, y1, x2, y2
+
+    def _detect_candidates(
+        self,
+        image: np.ndarray,
+        source: str,
+        image_w: int,
+        image_h: int,
+        xoff: int = 0,
+        yoff: int = 0,
+        reject_internal_tile_edges: bool = False,
+    ) -> list[FaceCandidate]:
+        detector = self._get_thread_detector()
+        bboxes, kpss = detector.detect(image, input_size=(640, 640), max_num=0)
+        if bboxes is None or len(bboxes) == 0 or kpss is None:
+            return []
+
+        local_h, local_w = image.shape[:2]
+        results: list[FaceCandidate] = []
+        rescue_threshold = min(self.settings.detector_threshold, self.settings.rescue_detector_threshold)
+        for index, row in enumerate(np.asarray(bboxes)):
+            if row.size < 5:
                 continue
-            session = getattr(model, "session", None)
-            if session is None:
+            lx1, ly1, lx2, ly2, score = map(float, row[:5])
+            if score < rescue_threshold:
                 continue
-            feed: dict[str, np.ndarray] = {}
-            for inp in session.get_inputs():
-                safe_shape = [dim if isinstance(dim, int) and dim > 0 else 1 for dim in inp.shape]
-                type_name = str(getattr(inp, "type", "tensor(float)"))
-                if "float16" in type_name:
-                    dtype = np.float16
-                elif "double" in type_name:
-                    dtype = np.float64
-                elif "int64" in type_name:
-                    dtype = np.int64
-                elif "int32" in type_name:
-                    dtype = np.int32
-                elif "uint8" in type_name:
-                    dtype = np.uint8
-                else:
-                    dtype = np.float32
-                feed[inp.name] = np.zeros(safe_shape, dtype=dtype)
-            try:
-                session.run(None, feed)
-            except Exception as exc:
-                raise RuntimeError(f"Не удалось прогреть ONNX-модель {name}: {exc}") from exc
-        self.log("Модели готовы.")
+            fw = max(1.0, lx2 - lx1)
+            fh = max(1.0, ly2 - ly1)
+            if reject_internal_tile_edges:
+                edge_margin = max(6.0, min(28.0, min(fw, fh) * 0.10))
+                if xoff > 0 and lx1 <= edge_margin:
+                    continue
+                if yoff > 0 and ly1 <= edge_margin:
+                    continue
+                if xoff + local_w < image_w and lx2 >= local_w - edge_margin:
+                    continue
+                if yoff + local_h < image_h and ly2 >= local_h - edge_margin:
+                    continue
+
+            raw_bbox = (lx1 + xoff, ly1 + yoff, lx2 + xoff, ly2 + yoff)
+            bbox = self._clip_bbox(raw_bbox, image_w, image_h)
+            if bbox is None:
+                continue
+            kps = np.asarray(kpss[index], dtype=np.float32).copy()
+            if kps.shape != (5, 2) or not np.isfinite(kps).all():
+                continue
+            kps[:, 0] += float(xoff)
+            kps[:, 1] += float(yoff)
+            actual_source = source if score >= self.settings.detector_threshold else f"rescue-{source}"
+            results.append(
+                FaceCandidate(
+                    bbox=bbox,
+                    raw_bbox=raw_bbox,
+                    kps=kps,
+                    det_score=score,
+                    source=actual_source,
+                )
+            )
+        return results
+
+    def _head_clipping_reasons(
+        self,
+        raw_bbox: tuple[float, float, float, float],
+        image_w: int,
+        image_h: int,
+    ) -> list[str]:
+        if not self.settings.reject_head_clipping:
+            return []
+        x1, y1, x2, y2 = raw_bbox
+        fw = max(1.0, x2 - x1)
+        fh = max(1.0, y2 - y1)
+        reasons: list[str] = []
+
+        # Если сам bbox вышел за реальную границу фото, это сильный сигнал.
+        hard_tol_x = max(2.0, fw * 0.015)
+        hard_tol_y = max(2.0, fh * 0.015)
+        if y1 < -hard_tol_y:
+            reasons.append("лицо/голова фактически обрезаны верхним краем кадра")
+        if x1 < -hard_tol_x or x2 > image_w + hard_tol_x:
+            reasons.append("лицо/голова фактически обрезаны боковым краем кадра")
+        if y2 > image_h + hard_tol_y:
+            reasons.append("подбородок фактически обрезан нижним краем кадра")
+
+        # SCRFD bbox описывает лицо, а не всю голову. Для макушки и боков нужен
+        # дополнительный анатомический запас. Эта проверка ловит кадры, где bbox
+        # ещё помещается, но волосы/макушка уже срезаны границей фотографии.
+        top_clearance = max(0.0, y1)
+        left_clearance = max(0.0, x1)
+        right_clearance = max(0.0, image_w - x2)
+        bottom_clearance = max(0.0, image_h - y2)
+        if top_clearance < fh * self.settings.head_top_margin_ratio:
+            reasons.append("слишком мало места над лицом: вероятно обрезана макушка")
+        if min(left_clearance, right_clearance) < fw * self.settings.head_side_margin_ratio:
+            reasons.append("слишком мало места сбоку от лица: вероятно обрезана голова")
+        if bottom_clearance < fh * self.settings.chin_margin_ratio:
+            reasons.append("слишком мало места под лицом: вероятно обрезан подбородок")
+
+        # Если уже есть прямой признак физической обрезки головы, дополнительная
+        # композиционная причина только засорит rejected.csv.
+        if reasons:
+            return reasons
+
+        # Отдельная композиционная защита от случайно попавших в край кадра людей.
+        # Фиксированный процент здесь работает плохо: для группового кадра лицо может
+        # занимать 0.05% площади, а для тесного портрета — 10% и более. Поэтому
+        # требуемый отступ плавно увеличивается при уменьшении лица.
+        frame_area = max(1.0, float(image_w) * float(image_h))
+        face_area_ratio = max(1.0e-8, min(1.0, (fw * fh) / frame_area))
+        ref_area = max(1.0e-8, self.settings.edge_guard_reference_face_area)
+        size_scale = (ref_area / face_area_ratio) ** self.settings.edge_guard_size_exponent
+        # Сам guard ограничен min/max ratio, поэтому экстремально маленький bbox
+        # не сможет потребовать половину кадра свободного пространства.
+        guard_ratio = self.settings.edge_guard_base_ratio * size_scale
+        guard_ratio = max(self.settings.edge_guard_min_ratio, min(self.settings.edge_guard_max_ratio, guard_ratio))
+
+        # Сначала расширяем bbox до минимально ожидаемой области головы, затем
+        # требуем ещё композиционный отступ от реальной границы фотографии.
+        projected_left = x1 - fw * self.settings.head_side_margin_ratio
+        projected_right = x2 + fw * self.settings.head_side_margin_ratio
+        projected_top = y1 - fh * self.settings.head_top_margin_ratio
+        projected_bottom = y2 + fh * self.settings.chin_margin_ratio
+
+        required_x = float(image_w) * guard_ratio
+        required_y = float(image_h) * guard_ratio
+        side_gap = min(projected_left, float(image_w) - projected_right)
+        top_gap = projected_top
+        bottom_gap = float(image_h) - projected_bottom
+        face_area_pct = face_area_ratio * 100.0
+
+        if side_gap < required_x:
+            reasons.append(
+                f"голова слишком близко к боковому краю кадра "
+                f"(лицо {face_area_pct:.2f}% кадра, нужен отступ ~{guard_ratio * 100:.1f}%)"
+            )
+        if top_gap < required_y:
+            reasons.append(
+                f"голова слишком близко к верхнему краю кадра "
+                f"(лицо {face_area_pct:.2f}% кадра, нужен отступ ~{guard_ratio * 100:.1f}%)"
+            )
+        if bottom_gap < required_y:
+            reasons.append(
+                f"голова слишком близко к нижнему краю кадра "
+                f"(лицо {face_area_pct:.2f}% кадра, нужен отступ ~{guard_ratio * 100:.1f}%)"
+            )
+        return reasons
 
     def _record_from_face(
         self,
         quality_image: np.ndarray,
         face,
-        bbox: tuple[int, int, int, int],
-        source: str,
+        candidate: FaceCandidate,
+        *,
+        apply_head_clipping: bool = True,
     ) -> FaceRecord:
         emb = getattr(face, "normed_embedding", None)
         if emb is None:
@@ -518,14 +716,16 @@ class FaceEngine:
             raise ValueError("InsightFace не вернул embedding")
         embedding = _l2_normalize(emb)
 
-        det_score = float(getattr(face, "det_score", 0.0) or 0.0)
         reasons: list[str] = []
-        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = candidate.bbox
         fw, fh = x2 - x1, y2 - y1
         if self.settings.reject_small_face and min(fw, fh) < self.settings.min_face_px:
             reasons.append(f"слишком маленькое лицо ({min(fw, fh)} px)")
 
-        crop = _safe_crop(quality_image, bbox)
+        if apply_head_clipping:
+            reasons.extend(self._head_clipping_reasons(candidate.raw_bbox, quality_image.shape[1], quality_image.shape[0]))
+
+        crop = _safe_crop(quality_image, candidate.bbox)
         blur = _blur_score(crop)
         if self.settings.reject_blur and blur is not None and blur < self.settings.blur_threshold:
             reasons.append(f"нерезкое лицо ({blur:.1f})")
@@ -562,64 +762,116 @@ class FaceEngine:
 
         return FaceRecord(
             embedding=embedding,
-            bbox=bbox,
-            det_score=det_score,
+            bbox=candidate.bbox,
+            raw_bbox=candidate.raw_bbox,
+            det_score=candidate.det_score,
             quality_reasons=reasons,
             blur_score=blur,
             eye_left=left_eye,
             eye_right=right_eye,
             pose=pose_tuple,
-            source=source,
+            source=candidate.source,
         )
 
-    @staticmethod
-    def _mapped_bbox(face, image_w: int, image_h: int, xoff: int = 0, yoff: int = 0) -> tuple[int, int, int, int] | None:
-        bbox_arr = np.asarray(getattr(face, "bbox", []), dtype=np.float32).reshape(-1)
-        if bbox_arr.size < 4:
-            return None
-        x1 = max(0, min(image_w - 1, int(round(float(bbox_arr[0]))) + xoff))
-        y1 = max(0, min(image_h - 1, int(round(float(bbox_arr[1]))) + yoff))
-        x2 = max(x1 + 1, min(image_w, int(round(float(bbox_arr[2]))) + xoff))
-        y2 = max(y1 + 1, min(image_h, int(round(float(bbox_arr[3]))) + yoff))
-        return x1, y1, x2, y2
+    def _analyze_candidates(
+        self,
+        image: np.ndarray,
+        candidates: list[FaceCandidate],
+        *,
+        reference: bool = False,
+    ) -> list[FaceRecord]:
+        if not candidates:
+            return []
+        if self.recognition_model is None:
+            raise RuntimeError("Recognition model не инициализирован")
+
+        from insightface.app.common import Face
+        from insightface.utils import face_align
+
+        faces = [
+            Face(
+                bbox=np.asarray(candidate.bbox, dtype=np.float32),
+                kps=np.asarray(candidate.kps, dtype=np.float32),
+                det_score=float(candidate.det_score),
+            )
+            for candidate in candidates
+        ]
+
+        # Главное ускорение новой архитектуры: после общего NMS каждое лицо
+        # проходит ArcFace только один раз; нормализованные crops отправляются
+        # в модель батчами вместо recognition для каждого overlap-тайла.
+        crops: list[np.ndarray] = []
+        input_size = int(getattr(self.recognition_model, "input_size", (112, 112))[0])
+        for face in faces:
+            crops.append(face_align.norm_crop(image, landmark=face.kps, image_size=input_size))
+
+        batch_size = max(1, int(self.settings.recognition_batch_size))
+        try:
+            embeddings: list[np.ndarray] = []
+            for start in range(0, len(crops), batch_size):
+                chunk = crops[start:start + batch_size]
+                features = np.asarray(self.recognition_model.get_feat(chunk), dtype=np.float32)
+                if features.ndim == 1:
+                    features = features.reshape(1, -1)
+                embeddings.extend(features)
+            if len(embeddings) != len(faces):
+                raise RuntimeError("ArcFace вернул неверное число embeddings")
+            for face, embedding in zip(faces, embeddings):
+                face.embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        except Exception as batch_error:
+            self.log(f"Batch ArcFace недоступен ({batch_error}); fallback на одиночный режим")
+            for face in faces:
+                self.recognition_model.get(image, face)
+
+        # Landmarks запускаются только для уже дедуплицированных лиц.
+        for face in faces:
+            for model in self.landmark_models:
+                model.get(image, face)
+
+        records: list[FaceRecord] = []
+        for face, candidate in zip(faces, candidates):
+            try:
+                records.append(
+                    self._record_from_face(
+                        image,
+                        face,
+                        candidate,
+                        apply_head_clipping=not reference,
+                    )
+                )
+            except Exception as exc:
+                self.log(f"Лицо {candidate.source} пропущено: {exc}")
+        return records
 
     def analyze_reference(self, image: np.ndarray, path: Path) -> ImageAnalysis:
-        if self.analyzer is None:
-            raise RuntimeError("FaceEngine не инициализирован")
-        faces = self.analyzer.get(image)
-        strong = [
-            f for f in faces
-            if float(getattr(f, "det_score", 0.0) or 0.0) >= self.settings.reference_min_det_score
-        ]
+        h, w = image.shape[:2]
+        candidates = self._detect_candidates(image, "reference", w, h)
+        strong = [candidate for candidate in candidates if candidate.det_score >= self.settings.reference_min_det_score]
+        strong = _nms_records(strong, self.settings.nms_iou_threshold)
         if len(strong) != 1:
             return ImageAnalysis(
                 path=path,
                 faces=[],
                 error=f"на эталоне требуется ровно 1 уверенно найденное лицо; найдено {len(strong)}",
-                full_detected=len(faces),
+                full_detected=len(candidates),
             )
-        h, w = image.shape[:2]
-        bbox = self._mapped_bbox(strong[0], w, h)
-        if bbox is None:
-            return ImageAnalysis(path=path, faces=[], error="InsightFace не вернул bbox эталона")
-        try:
-            record = self._record_from_face(image, strong[0], bbox, "reference")
-        except Exception as exc:
-            return ImageAnalysis(path=path, faces=[], error=str(exc), full_detected=len(faces))
-        return ImageAnalysis(path=path, faces=[record], full_detected=len(faces))
+        records = self._analyze_candidates(image, strong, reference=True)
+        if len(records) != 1:
+            return ImageAnalysis(path=path, faces=[], error="не удалось проанализировать лицо эталона")
+        return ImageAnalysis(path=path, faces=records, full_detected=len(candidates))
 
-    def _tile_records(self, image: np.ndarray) -> tuple[list[FaceRecord], int]:
+    def _tile_candidates(self, image: np.ndarray) -> tuple[list[FaceCandidate], int]:
         if not self.settings.tile_enabled:
             return [], 0
         h, w = image.shape[:2]
         if max(h, w) <= self.settings.tile_trigger_px or (h <= self.settings.tile_size and w <= self.settings.tile_size):
             return [], 0
 
-        tile_size = max(640, int(self.settings.tile_size))
+        tile_size = max(800, int(self.settings.tile_size))
         overlap = min(0.45, max(0.0, float(self.settings.tile_overlap)))
         xs = _tile_positions(w, tile_size, overlap)
         ys = _tile_positions(h, tile_size, overlap)
-        records: list[FaceRecord] = []
+        candidates: list[FaceCandidate] = []
         tiles_used = 0
 
         for y0 in ys:
@@ -632,62 +884,43 @@ class FaceEngine:
                 if tile.size == 0:
                     continue
                 tiles_used += 1
-                faces = self.analyzer.get(tile)
-                th, tw = tile.shape[:2]
-                for face in faces:
-                    local = np.asarray(getattr(face, "bbox", []), dtype=np.float32).reshape(-1)
-                    if local.size < 4:
-                        continue
-                    lx1, ly1, lx2, ly2 = map(float, local[:4])
-                    fw = max(1.0, lx2 - lx1)
-                    fh = max(1.0, ly2 - ly1)
-                    edge_margin = max(6.0, min(28.0, min(fw, fh) * 0.10))
-                    # Не используем лицо, обрезанное внутренней границей тайла.
-                    # Благодаря перекрытию оно должно целиком попасть в соседний тайл.
-                    if x0 > 0 and lx1 <= edge_margin:
-                        continue
-                    if y0 > 0 and ly1 <= edge_margin:
-                        continue
-                    if x0 + tw < w and lx2 >= tw - edge_margin:
-                        continue
-                    if y0 + th < h and ly2 >= th - edge_margin:
-                        continue
-
-                    bbox = self._mapped_bbox(face, w, h, x0, y0)
-                    if bbox is None:
-                        continue
-                    try:
-                        records.append(self._record_from_face(image, face, bbox, "tile"))
-                    except Exception:
-                        continue
-        return records, tiles_used
+                candidates.extend(
+                    self._detect_candidates(
+                        tile,
+                        "tile",
+                        w,
+                        h,
+                        xoff=x0,
+                        yoff=y0,
+                        reject_internal_tile_edges=True,
+                    )
+                )
+        return candidates, tiles_used
 
     def analyze(self, image: np.ndarray, path: Path) -> ImageAnalysis:
-        if self.analyzer is None:
-            raise RuntimeError("FaceEngine не инициализирован")
         h, w = image.shape[:2]
-        full_faces = self.analyzer.get(image)
-        records: list[FaceRecord] = []
-        for face in full_faces:
-            bbox = self._mapped_bbox(face, w, h)
-            if bbox is None:
-                continue
-            try:
-                records.append(self._record_from_face(image, face, bbox, "full"))
-            except Exception as exc:
-                self.log(f"{path.name}: лицо полного кадра пропущено: {exc}")
+        full_candidates = self._detect_candidates(image, "full", w, h)
+        tile_candidates, tiles_used = self._tile_candidates(image)
+        all_candidates = _nms_records(full_candidates + tile_candidates, self.settings.nms_iou_threshold)
 
-        tile_records, tiles_used = self._tile_records(image)
-        all_records = records + tile_records
-        deduped = _nms_records(all_records, self.settings.nms_iou_threshold)
+        # Слабые rescue-кандидаты полезны, но на аномальном кадре не должны
+        # породить тысячи ArcFace crops. Сильные кандидаты не ограничиваются.
+        strong = [c for c in all_candidates if c.det_score >= self.settings.detector_threshold]
+        weak = [c for c in all_candidates if c.det_score < self.settings.detector_threshold]
+        weak.sort(
+            key=lambda c: (c.det_score, (c.bbox[2] - c.bbox[0]) * (c.bbox[3] - c.bbox[1])),
+            reverse=True,
+        )
+        candidates = strong + weak[: max(0, int(self.settings.rescue_max_candidates))]
+        candidates.sort(key=lambda c: (c.bbox[1], c.bbox[0]))
+        records = self._analyze_candidates(image, candidates)
         return ImageAnalysis(
             path=path,
-            faces=deduped,
-            full_detected=len(records),
-            tile_detected=len(tile_records),
+            faces=records,
+            full_detected=len(full_candidates),
+            tile_detected=len(tile_candidates),
             tiles_used=tiles_used,
         )
-
 
 class ChildFaceFinder:
     def __init__(
@@ -785,7 +1018,7 @@ class ChildFaceFinder:
     def _build_references(self, folder: Path, temp_dir: Path) -> ReferenceSet:
         # Эталонная папка всегда сканируется рекурсивно: поза/тип кадра может
         # задаваться подкаталогом (например, portrait/ и standing/), но каталог
-        # никогда не является частью ID ребёнка.
+        # никогда не является частью ID цели.
         paths = iter_candidate_files(folder, recursive=True)
         if not paths:
             raise RuntimeError("В папке эталонов нет файлов")
@@ -829,10 +1062,10 @@ class ChildFaceFinder:
             raise RuntimeError("Не удалось получить ни одного качественного эталонного лица")
 
         valid_keys = sorted(embeddings.keys(), key=lambda k: display_by_key[k].casefold())
-        child_ids = [display_by_key[k] for k in valid_keys]
-        child_index_by_key = {key: idx for idx, key in enumerate(valid_keys)}
+        person_ids = [display_by_key[k] for k in valid_keys]
+        person_index_by_key = {key: idx for idx, key in enumerate(valid_keys)}
         vectors: list[np.ndarray] = []
-        ref_child_indices: list[int] = []
+        ref_person_indices: list[int] = []
 
         for key in valid_keys:
             refs = embeddings[key]
@@ -858,12 +1091,12 @@ class ChildFaceFinder:
                     )
             for vector, _path in refs:
                 vectors.append(vector)
-                ref_child_indices.append(child_index_by_key[key])
+                ref_person_indices.append(person_index_by_key[key])
 
         matrix = np.stack(vectors, axis=0).astype(np.float32, copy=False)
-        index_array = np.asarray(ref_child_indices, dtype=np.int32)
-        self.log(f"Готово эталонов: {len(child_ids)} детей из {len(vectors)} файлов")
-        return ReferenceSet(child_ids=child_ids, matrix=matrix, ref_child_indices=index_array, file_count=len(vectors))
+        index_array = np.asarray(ref_person_indices, dtype=np.int32)
+        self.log(f"Готово эталонов: {len(person_ids)} целей из {len(vectors)} файлов")
+        return ReferenceSet(person_ids=person_ids, matrix=matrix, ref_person_indices=index_array, file_count=len(vectors))
 
     def _match_face(
         self,
@@ -871,23 +1104,23 @@ class ChildFaceFinder:
         references: ReferenceSet,
     ) -> tuple[str | None, str, float, str | None, float | None, str | None]:
         ref_distances = 1.0 - np.matmul(references.matrix, face.embedding)
-        child_distances = np.full(len(references.child_ids), np.inf, dtype=np.float32)
-        np.minimum.at(child_distances, references.ref_child_indices, ref_distances)
-        order = np.argsort(child_distances)
+        person_distances = np.full(len(references.person_ids), np.inf, dtype=np.float32)
+        np.minimum.at(person_distances, references.ref_person_indices, ref_distances)
+        order = np.argsort(person_distances)
         best_idx = int(order[0])
-        best_id = references.child_ids[best_idx]
-        best_dist = float(child_distances[best_idx])
+        best_id = references.person_ids[best_idx]
+        best_dist = float(person_distances[best_idx])
         second_id: str | None = None
         second_dist: float | None = None
         if len(order) > 1:
             second_idx = int(order[1])
-            second_id = references.child_ids[second_idx]
-            second_dist = float(child_distances[second_idx])
+            second_id = references.person_ids[second_idx]
+            second_dist = float(person_distances[second_idx])
 
         if best_dist > self.settings.match_threshold:
             return None, best_id, best_dist, second_id, second_dist, "дистанция выше порога"
         if second_dist is not None and (second_dist - best_dist) < self.settings.ambiguity_margin:
-            return None, best_id, best_dist, second_id, second_dist, "слишком близкий второй ребёнок"
+            return None, best_id, best_dist, second_id, second_dist, "слишком близкая вторая цель"
         return best_id, best_id, best_dist, second_id, second_dist, None
 
     @staticmethod
@@ -923,10 +1156,7 @@ class ChildFaceFinder:
             if not photo_paths:
                 raise RuntimeError("В папке фотографий нет файлов")
 
-            matches: dict[tuple[str, str], float] = {}
-            rejects: dict[tuple[str, str], tuple[float, str]] = {}
-            reviews: list[list[object]] = []
-
+            analyses: list[ImageAnalysis] = []
             done = 0
             for analysis in self._pipeline(photo_paths, temp_dir, references=False):
                 done += 1
@@ -935,70 +1165,173 @@ class ChildFaceFinder:
                     if analysis.error != "отменено":
                         self.log(f"{analysis.path.name}: {analysis.error}")
                     continue
-
-                photo_id = analysis.path.stem
-                per_photo_accept: dict[str, float] = {}
-                per_photo_reject: dict[str, tuple[float, str]] = {}
-                review_count_before = len(reviews)
-
-                for face in analysis.faces:
-                    child_id, best_id, dist, second_id, second_dist, match_problem = self._match_face(face, references)
-                    if child_id is None:
-                        if dist <= self.settings.match_threshold + 0.08:
-                            reviews.append([
-                                photo_id,
-                                best_id,
-                                f"{dist:.4f}",
-                                second_id or "",
-                                "" if second_dist is None else f"{second_dist:.4f}",
-                                match_problem or "неуверенное совпадение",
-                            ])
-                        continue
-
-                    if face.quality_reasons:
-                        reason = "; ".join(face.quality_reasons)
-                        old = per_photo_reject.get(child_id)
-                        if old is None or dist < old[0]:
-                            per_photo_reject[child_id] = (dist, reason)
-                    else:
-                        old = per_photo_accept.get(child_id)
-                        if old is None or dist < old:
-                            per_photo_accept[child_id] = dist
-
-                for child_id, dist in per_photo_accept.items():
-                    key = (child_id, photo_id)
-                    old = matches.get(key)
-                    if old is None or dist < old:
-                        matches[key] = dist
-                    rejects.pop(key, None)
-
-                for child_id, (dist, reason) in per_photo_reject.items():
-                    key = (child_id, photo_id)
-                    if key not in matches:
-                        old = rejects.get(key)
-                        if old is None or dist < old[0]:
-                            rejects[key] = (dist, reason)
-
+                analyses.append(analysis)
                 if self.settings.verbose_diagnostics:
+                    rescue_count = sum(face.source.startswith("rescue-") for face in analysis.faces)
                     self.log(
                         f"{analysis.path.name}: full={analysis.full_detected}; "
-                        f"tiles=+{analysis.tile_detected} ({analysis.tiles_used} проходов); "
-                        f"после NMS={len(analysis.faces)}; результат={len(per_photo_accept)}; "
-                        f"отбраковано={len(per_photo_reject)}; review={len(reviews) - review_count_before}"
+                        f"tiles=+{analysis.tile_detected} ({analysis.tiles_used} проходов SCRFD); "
+                        f"после NMS/ArcFace={len(analysis.faces)}; rescue={rescue_count}"
                     )
 
             if self.cancel_event.is_set():
                 raise CancelledError("Обработка отменена")
 
+            # Первый проход matching: только исходные пользовательские эталоны.
+            base_matches: dict[int, list[tuple[FaceRecord, tuple[str | None, str, float, str | None, float | None, str | None]]]] = {}
+            anchor_candidates: dict[str, list[tuple[float, np.ndarray]]] = defaultdict(list)
+            anchor_limit_distance = min(0.34, max(0.18, self.settings.match_threshold - 0.06))
+
+            for analysis_index, analysis in enumerate(analyses):
+                rows = []
+                for face in analysis.faces:
+                    info = self._match_face(face, references)
+                    rows.append((face, info))
+                    person_id, _best_id, dist, _second_id, _second_dist, _problem = info
+                    if (
+                        person_id is not None
+                        and not face.quality_reasons
+                        and not face.source.startswith("rescue-")
+                        and face.det_score >= max(0.40, self.settings.detector_threshold)
+                        and dist <= anchor_limit_distance
+                    ):
+                        anchor_candidates[person_id].append((dist, face.embedding))
+                base_matches[analysis_index] = rows
+
+            # Session anchors: до 8 самых уверенных лиц на цель. Они создаются
+            # только из первого прохода и никогда из восстановленных совпадений,
+            # поэтому второй проход не может сам себя "раскачать".
+            extra_vectors: list[np.ndarray] = []
+            extra_indices: list[int] = []
+            person_index = {person: index for index, person in enumerate(references.person_ids)}
+            for person, values in anchor_candidates.items():
+                values.sort(key=lambda item: item[0])
+                for _dist, vector in values[:8]:
+                    extra_vectors.append(vector)
+                    extra_indices.append(person_index[person])
+
+            expanded_references = references
+            if extra_vectors:
+                expanded_references = ReferenceSet(
+                    person_ids=references.person_ids,
+                    matrix=np.concatenate(
+                        [references.matrix, np.stack(extra_vectors).astype(np.float32, copy=False)], axis=0
+                    ),
+                    ref_person_indices=np.concatenate(
+                        [references.ref_person_indices, np.asarray(extra_indices, dtype=np.int32)], axis=0
+                    ),
+                    file_count=references.file_count,
+                )
+                self.log(
+                    f"Session anchors: добавлено {len(extra_vectors)} уверенных временных эталонов "
+                    f"для {len(anchor_candidates)} целей."
+                )
+
+            matches: dict[tuple[str, str], tuple[float, str]] = {}
+            match_details: dict[tuple[str, str], tuple[float, str, FaceRecord, Path]] = {}
+            rejects: dict[tuple[str, str], tuple[float, str, str]] = {}
+            reviews: list[list[object]] = []
+            recovered = 0
+
+            for analysis_index, analysis in enumerate(analyses):
+                try:
+                    relative_path = analysis.path.relative_to(photos_dir).as_posix()
+                except ValueError:
+                    relative_path = analysis.path.name
+                photo_id = analysis.path.stem
+                per_photo_accept: dict[str, tuple[float, str, FaceRecord]] = {}
+                per_photo_reject: dict[str, tuple[float, str, str]] = {}
+                review_for_photo: list[list[object]] = []
+
+                for face, base_info in base_matches[analysis_index]:
+                    person_id, best_id, dist, second_id, second_dist, match_problem = base_info
+                    used_info = base_info
+                    recovered_by_anchor = False
+
+                    # Только пограничные лица рассматриваются повторно. Требуем,
+                    # чтобы исходно лучшей целью оставалась та же цель, а расширенная
+                    # галерея дала реальное улучшение и прошла обычный margin.
+                    if (
+                        person_id is None
+                        and extra_vectors
+                        and dist <= self.settings.match_threshold + 0.10
+                    ):
+                        expanded_info = self._match_face(face, expanded_references)
+                        expanded_person, expanded_best, expanded_dist, expanded_second, expanded_second_dist, expanded_problem = expanded_info
+                        if (
+                            expanded_person is not None
+                            and expanded_best == best_id
+                            and expanded_dist <= dist - 0.015
+                        ):
+                            person_id = expanded_person
+                            used_info = expanded_info
+                            best_id = expanded_best
+                            dist = expanded_dist
+                            second_id = expanded_second
+                            second_dist = expanded_second_dist
+                            match_problem = expanded_problem
+                            recovered_by_anchor = True
+                            recovered += 1
+
+                    if person_id is None:
+                        if dist <= self.settings.match_threshold + 0.08:
+                            review_for_photo.append([
+                                photo_id,
+                                relative_path,
+                                best_id,
+                                f"{dist:.4f}",
+                                second_id or "",
+                                "" if second_dist is None else f"{second_dist:.4f}",
+                                match_problem or "неуверенное совпадение",
+                                face.source,
+                            ])
+                        continue
+
+                    match_source = "session-anchor" if recovered_by_anchor else face.source
+                    if face.quality_reasons:
+                        reason = "; ".join(face.quality_reasons)
+                        old = per_photo_reject.get(person_id)
+                        if old is None or dist < old[0]:
+                            per_photo_reject[person_id] = (dist, reason, match_source)
+                    else:
+                        old = per_photo_accept.get(person_id)
+                        if old is None or dist < old[0]:
+                            per_photo_accept[person_id] = (dist, match_source, face)
+
+                for person_id, (dist, source, face) in per_photo_accept.items():
+                    key = (person_id, relative_path)
+                    old = matches.get(key)
+                    if old is None or dist < old[0]:
+                        matches[key] = (dist, source)
+                        match_details[key] = (dist, source, face, analysis.path)
+                    rejects.pop(key, None)
+
+                for person_id, (dist, reason, source) in per_photo_reject.items():
+                    key = (person_id, relative_path)
+                    if key not in matches:
+                        old = rejects.get(key)
+                        if old is None or dist < old[0]:
+                            rejects[key] = (dist, reason, source)
+
+                reviews.extend(review_for_photo)
+                if self.settings.verbose_diagnostics:
+                    self.log(
+                        f"{analysis.path.name}: результат={len(per_photo_accept)}; "
+                        f"отбраковано={len(per_photo_reject)}; review={len(review_for_photo)}"
+                    )
+
+            if recovered:
+                self.log(f"Session anchors: восстановлено пограничных совпадений: {recovered}")
+
             match_rows = [
-                [child_id, photo_id]
-                for (child_id, photo_id), _ in sorted(
+                [person_id, Path(relative_path).stem, relative_path]
+                for (person_id, relative_path), (_dist, _source) in sorted(
                     matches.items(), key=lambda item: (item[0][0].casefold(), item[0][1].casefold())
                 )
             ]
             rejected_rows = [
-                [child_id, photo_id, reason, f"{dist:.4f}"]
-                for (child_id, photo_id), (dist, reason) in sorted(
+                [person_id, Path(relative_path).stem, relative_path, reason, f"{dist:.4f}", source]
+                for (person_id, relative_path), (dist, reason, source) in sorted(
                     rejects.items(), key=lambda item: (item[0][0].casefold(), item[0][1].casefold())
                 )
             ]
@@ -1007,22 +1340,82 @@ class ChildFaceFinder:
             review_csv = output_csv.with_name(output_csv.stem + "_review.csv")
             self._write_csv_atomic(
                 output_csv,
-                ["Идентификатор ребенка", "номер фото с этим ребенком"],
+                ["Идентификатор цели", "номер фото с этой целью", "Исходный файл"],
                 match_rows,
             )
             self._write_csv_atomic(
                 rejected_csv,
-                ["Идентификатор ребенка", "номер фото", "Причина", "Cosine distance"],
+                ["Идентификатор цели", "номер фото", "Исходный файл", "Причина", "Cosine distance", "Источник"],
                 rejected_rows,
             )
             self._write_csv_atomic(
                 review_csv,
-                ["номер фото", "Лучший кандидат", "Distance", "Второй кандидат", "Distance 2", "Причина"],
+                ["номер фото", "Исходный файл", "Лучший кандидат", "Distance", "Второй кандидат", "Distance 2", "Причина", "Источник"],
                 reviews,
             )
 
+            best_csv: Path | None = None
+            best_series_count = 0
+            if self.settings.select_best_series:
+                self.log("Серии: определение последовательных серий отдельно для каждой цели…")
+                best_candidates = [
+                    BestFrameCandidate(
+                        person_id=person_id,
+                        path=path,
+                        relative_path=relative_path,
+                        photo_id=path.stem,
+                        distance=dist,
+                        source=source,
+                        det_score=face.det_score,
+                        blur_score=face.blur_score,
+                        eye_left=face.eye_left,
+                        eye_right=face.eye_right,
+                        pose=face.pose,
+                    )
+                    for (person_id, relative_path), (dist, source, face, path) in match_details.items()
+                ]
+                selections = select_best_series_frames(
+                    best_candidates,
+                    match_threshold=self.settings.match_threshold,
+                    eye_open_threshold=self.settings.eye_ratio_min,
+                    max_gap_seconds=self.settings.series_max_gap_seconds,
+                    max_filename_gap=self.settings.series_max_filename_gap,
+                )
+                best_rows = []
+                for selection in selections:
+                    candidate = selection.candidate
+                    eye_text = "" if selection.eye_score is None else f"{selection.eye_score:.4f}"
+                    blur_text = "" if candidate.blur_score is None else f"{candidate.blur_score:.2f}"
+                    best_rows.append([
+                        selection.person_id,
+                        candidate.photo_id,
+                        candidate.relative_path,
+                        selection.series_index,
+                        selection.series_size,
+                        f"{selection.score:.4f}",
+                        f"{candidate.distance:.4f}",
+                        blur_text,
+                        eye_text,
+                        f"{selection.pose_score:.4f}",
+                        candidate.source,
+                    ])
+                best_csv = output_csv.with_name(output_csv.stem + "_best.csv")
+                self._write_csv_atomic(
+                    best_csv,
+                    [
+                        "Идентификатор цели", "номер фото с этой целью", "Исходный файл",
+                        "Серия", "Кадров в серии", "Best score", "Cosine distance",
+                        "Резкость лица", "Открытость глаз", "Pose score", "Источник",
+                    ],
+                    best_rows,
+                )
+                best_series_count = len(best_rows)
+                self.log(
+                    f"Серии: выбрано лучших кадров: {best_series_count}; CSV: {best_csv}"
+                )
+
         return RunSummary(
-            reference_ids=len(references.child_ids),
+            reference_ids=len(references.person_ids),
             reference_files=references.file_count,
             photo_count=len(photo_paths),
             matched_pairs=len(match_rows),
@@ -1031,4 +1424,6 @@ class ChildFaceFinder:
             output_csv=output_csv,
             rejected_csv=rejected_csv,
             review_csv=review_csv,
+            best_csv=best_csv,
+            best_series_count=best_series_count,
         )

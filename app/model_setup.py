@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -49,8 +50,26 @@ def _download(url: str, destination: Path, retries: int = 3) -> None:
                             print(f"\rЗагрузка antelopev2: {downloaded / 1048576:.0f} MB", end="", flush=True)
                         last_print = now
                 print()
-            if destination.stat().st_size < 10_000_000:
+            actual_size = destination.stat().st_size
+            if actual_size < 10_000_000:
                 raise RuntimeError("загруженный архив слишком мал")
+            if total and actual_size != total:
+                raise RuntimeError(
+                    f"неполная загрузка модели: получено {actual_size} байт из {total}"
+                )
+
+            # Проверяем ZIP до выхода из retry-цикла. Иначе оборванная загрузка,
+            # которая закончилась обычным EOF и осталась >10 MB, падала бы уже
+            # на распаковке без повторной попытки скачать архив.
+            try:
+                with zipfile.ZipFile(destination) as zf:
+                    broken_member = zf.testzip()
+                    if broken_member is not None:
+                        raise RuntimeError(
+                            f"повреждён файл внутри архива модели: {broken_member}"
+                        )
+            except zipfile.BadZipFile as exc:
+                raise RuntimeError("загруженный файл модели не является корректным ZIP") from exc
             return
         except Exception as exc:
             last_error = exc
@@ -72,12 +91,42 @@ def _safe_extract(zip_path: Path, dest: Path) -> None:
         zf.extractall(dest)
 
 
+def _recover_interrupted_model_swap() -> None:
+    """Restore a valid previous model if Windows/power interrupted the swap."""
+    parent = MODEL_DIR.parent
+    if not parent.exists():
+        return
+
+    # Incomplete candidates were never made active and are safe to remove.
+    for candidate in parent.glob(f".{MODEL_NAME}.new.*"):
+        if candidate.is_dir():
+            shutil.rmtree(candidate, ignore_errors=True)
+
+    backups = sorted(
+        (p for p in parent.glob(f".{MODEL_NAME}.previous.*") if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if MODEL_DIR.exists():
+        # A valid active model wins. Old backup leftovers are non-fatal and may
+        # simply have been locked by antivirus during cleanup.
+        return
+
+    for backup in backups:
+        if model_is_valid(backup):
+            backup.rename(MODEL_DIR)
+            print(f"Восстановлена модель после прерванной предыдущей установки: {MODEL_DIR}")
+            return
+
+
+
 def ensure_antelopev2(force: bool = False) -> Path:
+    MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+    _recover_interrupted_model_swap()
+
     if model_is_valid() and not force:
         print(f"Модель уже установлена: {MODEL_DIR}")
         return MODEL_DIR
-
-    MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
 
     # Все промежуточные файлы находятся в системном TEMP и удаляются контекстом.
     with tempfile.TemporaryDirectory(prefix="ChildFaceFinder_model_") as tmp_name:
@@ -102,9 +151,36 @@ def ensure_antelopev2(force: bool = False) -> Path:
         if not model_is_valid(staged):
             raise RuntimeError("Проверка распакованной модели не пройдена")
 
-        if MODEL_DIR.exists():
-            shutil.rmtree(MODEL_DIR)
-        shutil.copytree(staged, MODEL_DIR)
+        # Install transactionally. First copy a complete verified candidate next
+        # to the final model directory; only then swap it into place. This keeps
+        # an existing working model intact if copying is interrupted.
+        install_candidate = MODEL_DIR.parent / f".{MODEL_NAME}.new.{uuid.uuid4().hex}"
+        backup = MODEL_DIR.parent / f".{MODEL_NAME}.previous.{uuid.uuid4().hex}"
+        try:
+            shutil.copytree(staged, install_candidate)
+            if not model_is_valid(install_candidate):
+                raise RuntimeError("Проверка подготовленной копии модели не пройдена")
+
+            had_old_model = MODEL_DIR.exists()
+            if had_old_model:
+                MODEL_DIR.rename(backup)
+            try:
+                install_candidate.rename(MODEL_DIR)
+            except Exception:
+                if had_old_model and backup.exists() and not MODEL_DIR.exists():
+                    backup.rename(MODEL_DIR)
+                raise
+
+            if backup.exists():
+                try:
+                    shutil.rmtree(backup)
+                except OSError as exc:
+                    print(f"Предупреждение: новая модель установлена, но старую резервную копию не удалось удалить: {backup} ({exc})")
+        finally:
+            if install_candidate.exists():
+                shutil.rmtree(install_candidate, ignore_errors=True)
+            # A backup should only remain if restoring failed. Do not delete it:
+            # it may be the last intact copy and the next run can report/repair it.
 
     if not model_is_valid():
         raise RuntimeError("Модель была скопирована, но итоговая проверка не пройдена")

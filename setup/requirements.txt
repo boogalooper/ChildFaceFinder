@@ -1,11 +1,16 @@
 # Runtime dependencies installed normally.
-# InsightFace itself is installed separately by install.bat with --no-deps,
-# because its metadata asks for CPU onnxruntime + GUI opencv-python.  This
+# InsightFace itself is installed separately by install.ps1 with --no-deps,
+# because its metadata asks for CPU onnxruntime + GUI opencv-python. This
 # project deliberately uses onnxruntime-gpu + opencv-python-headless instead.
 onnxruntime-gpu[cuda]==1.26.0
-# Pinned deliberately: ORT 1.26.0 Windows preload logic predates cuDNN 9.24
-# split sublibrary cudnn_engines_tensor_ir64_9.dll. cuDNN 9.7.1 is the
-# NVIDIA-recommended CUDA 12.8 configuration and supports Blackwell.
+# Pin the CUDA 12.8 component wheels too: ORT's [cuda] extra otherwise uses
+# compatible ranges and a reinstall months later can resolve a different stack.
+nvidia-cuda-nvrtc-cu12==12.8.61
+nvidia-cuda-runtime-cu12==12.8.57
+nvidia-cublas-cu12==12.8.3.14
+nvidia-cufft-cu12==11.3.3.41
+nvidia-curand-cu12==10.3.9.55
+nvidia-nvjitlink-cu12==12.8.61
 nvidia-cudnn-cu12==9.7.1.26
 numpy==1.26.4
 onnx==1.18.0

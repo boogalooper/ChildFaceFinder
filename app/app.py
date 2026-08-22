@@ -2,24 +2,18 @@ from __future__ import annotations
 
 import os
 import queue
-import site
 import threading
 import traceback
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-# Portable builds keep third-party packages outside the bundled CPython tree.
-# addsitedir() also processes any .pth files, unlike a plain PYTHONPATH entry.
-_PROJECT_DIR = Path(__file__).resolve().parent.parent
-_PORTABLE_SITE_PACKAGES = _PROJECT_DIR / "runtime" / "site-packages"
-if _PORTABLE_SITE_PACKAGES.is_dir():
-    site.addsitedir(str(_PORTABLE_SITE_PACKAGES))
-
+from collector import CollectorSummary, collect_from_csv
 from engine import CancelledError, ChildFaceFinder, RunSummary, Settings
 from image_loader import cleanup_stale_temp_dirs
+from user_settings import load_user_settings, save_user_settings
 
-APP_TITLE = "Child Face Finder"
+APP_TITLE = "Child Face Finder — поиск людей по эталонам"
 
 QUALITY_PRESETS = {
     "Мягкий": dict(
@@ -30,6 +24,12 @@ QUALITY_PRESETS = {
         eye_ratio_min=0.080,
         blur_threshold=25.0,
         max_clipped_fraction=0.70,
+        head_top_margin_ratio=0.12,
+        head_side_margin_ratio=0.05,
+        chin_margin_ratio=0.02,
+        edge_guard_base_ratio=0.012,
+        edge_guard_min_ratio=0.006,
+        edge_guard_max_ratio=0.035,
     ),
     "Нормальный": dict(
         min_face_px=45,
@@ -39,6 +39,12 @@ QUALITY_PRESETS = {
         eye_ratio_min=0.105,
         blur_threshold=45.0,
         max_clipped_fraction=0.55,
+        head_top_margin_ratio=0.18,
+        head_side_margin_ratio=0.07,
+        chin_margin_ratio=0.03,
+        edge_guard_base_ratio=0.020,
+        edge_guard_min_ratio=0.008,
+        edge_guard_max_ratio=0.050,
     ),
     "Строгий": dict(
         min_face_px=65,
@@ -48,14 +54,28 @@ QUALITY_PRESETS = {
         eye_ratio_min=0.125,
         blur_threshold=75.0,
         max_clipped_fraction=0.35,
+        head_top_margin_ratio=0.24,
+        head_side_margin_ratio=0.10,
+        chin_margin_ratio=0.05,
+        edge_guard_base_ratio=0.030,
+        edge_guard_min_ratio=0.012,
+        edge_guard_max_ratio=0.065,
     ),
 }
 
 SEARCH_MODES = {
-    "Быстрый": dict(tile_enabled=False, tile_size=2200, tile_overlap=0.18, tile_trigger_px=1800),
-    "Улучшенный": dict(tile_enabled=True, tile_size=2200, tile_overlap=0.18, tile_trigger_px=1800),
-    "Максимальный": dict(tile_enabled=True, tile_size=1600, tile_overlap=0.22, tile_trigger_px=1400),
+    "Быстрый": dict(tile_enabled=False, tile_size=1400, tile_overlap=0.18, tile_trigger_px=1600, rescue_detector_threshold=0.12, rescue_max_candidates=40),
+    "Улучшенный": dict(tile_enabled=True, tile_size=1400, tile_overlap=0.20, tile_trigger_px=1600, rescue_detector_threshold=0.10, rescue_max_candidates=80),
+    "Максимальный": dict(tile_enabled=True, tile_size=1000, tile_overlap=0.24, tile_trigger_px=1200, rescue_detector_threshold=0.08, rescue_max_candidates=120),
 }
+
+
+def _saved_int(values: dict, key: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(values.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
 
 
 class ToolTip:
@@ -133,32 +153,42 @@ class App(tk.Tk):
         self.events: queue.Queue[tuple] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.finder: ChildFaceFinder | None = None
+        self.collector_cancel_event: threading.Event | None = None
         self.closing_after_cancel = False
 
-        self.ref_var = tk.StringVar()
-        self.photos_var = tk.StringVar()
-        self.output_var = tk.StringVar()
+        saved = load_user_settings()
+        self.ref_var = tk.StringVar(value=str(saved.get("reference_folder", "")))
+        self.photos_var = tk.StringVar(value=str(saved.get("photo_folder", "")))
+        self.output_var = tk.StringVar(value=str(saved.get("output_csv", "")))
 
-        self.search_mode_var = tk.StringVar(value="Улучшенный")
-        self.detector_threshold_var = tk.StringVar(value="0.18")
-        self.quality_preset_var = tk.StringVar(value="Нормальный")
-        self.threshold_var = tk.StringVar(value="0.45")
-        self.margin_var = tk.StringVar(value="0.04")
+        self.search_mode_var = tk.StringVar(value=str(saved.get("search_mode", "Улучшенный")))
+        self.detector_threshold_var = tk.StringVar(value=str(saved.get("detector_threshold", "0.18")))
+        self.quality_preset_var = tk.StringVar(value=str(saved.get("quality_preset", "Нормальный")))
+        self.threshold_var = tk.StringVar(value=str(saved.get("match_threshold", "0.45")))
+        self.margin_var = tk.StringVar(value=str(saved.get("ambiguity_margin", "0.04")))
 
-        self.closed_eyes_var = tk.BooleanVar(value=True)
-        self.blur_var = tk.BooleanVar(value=True)
-        self.pose_var = tk.BooleanVar(value=True)
-        self.small_face_var = tk.BooleanVar(value=True)
-        self.exposure_var = tk.BooleanVar(value=False)
+        self.closed_eyes_var = tk.BooleanVar(value=bool(saved.get("reject_closed_eyes", True)))
+        self.blur_var = tk.BooleanVar(value=bool(saved.get("reject_blur", True)))
+        self.pose_var = tk.BooleanVar(value=bool(saved.get("reject_pose", True)))
+        self.small_face_var = tk.BooleanVar(value=bool(saved.get("reject_small_face", True)))
+        self.exposure_var = tk.BooleanVar(value=bool(saved.get("reject_exposure", False)))
+        self.head_clip_var = tk.BooleanVar(value=bool(saved.get("reject_head_clipping", True)))
 
-        self.decode_workers_var = tk.IntVar(value=max(2, min(8, os.cpu_count() or 4)))
-        self.inference_workers_var = tk.IntVar(value=2)
-        self.recursive_var = tk.BooleanVar(value=True)
-        self.require_gpu_var = tk.BooleanVar(value=True)
-        self.verbose_var = tk.BooleanVar(value=True)
+        self.decode_workers_var = tk.IntVar(value=_saved_int(saved, "decode_workers", max(2, min(8, os.cpu_count() or 4)), 1, 32))
+        self.inference_workers_var = tk.IntVar(value=_saved_int(saved, "gpu_sessions", 2, 1, 8))
+        self.recursive_var = tk.BooleanVar(value=bool(saved.get("recursive", True)))
+        self.require_gpu_var = tk.BooleanVar(value=bool(saved.get("require_gpu", True)))
+        self.verbose_var = tk.BooleanVar(value=bool(saved.get("verbose", True)))
+        self.best_series_var = tk.BooleanVar(value=bool(saved.get("select_best_series", False)))
+
+        if self.search_mode_var.get() not in SEARCH_MODES:
+            self.search_mode_var.set("Улучшенный")
+        if self.quality_preset_var.get() not in QUALITY_PRESETS:
+            self.quality_preset_var.set("Нормальный")
 
         self.status_var = tk.StringVar(value="Готово к запуску")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.collector_indeterminate = False
 
         self._build_ui()
         removed_temp, failed_temp = cleanup_stale_temp_dirs()
@@ -175,7 +205,7 @@ class App(tk.Tk):
         outer.columnconfigure(1, weight=1)
         outer.rowconfigure(9, weight=1)
 
-        ttk.Label(outer, text="Эталонные изображения детей:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(outer, text="Эталонные изображения целей (дети/взрослые):").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(outer, textvariable=self.ref_var).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
         ttk.Button(outer, text="Обзор…", command=self._browse_refs).grid(row=0, column=2, pady=4)
 
@@ -222,11 +252,11 @@ class App(tk.Tk):
             recognition,
             "Определяет глубину поиска маленьких лиц; пользователь выбирает один из трёх режимов.\n"
             "• Быстрый — только полный кадр, без тайлов. Самый быстрый, но чаще пропускает маленькие лица.\n"
-            "• Улучшенный — полный кадр + тайлы 2200 px с перекрытием 18%; рекомендуемый режим.\n"
-            "• Максимальный — полный кадр + тайлы 1600 px с перекрытием 22%; лучше для очень маленьких лиц, но медленнее.",
+            "• Улучшенный — полный кадр + тайлы 1400 px с перекрытием 20%; рекомендуемый режим.\n"
+            "• Максимальный — полный кадр + тайлы 1000 px с перекрытием 24%; лучше для очень маленьких лиц, но медленнее.",
         ).grid(row=0, column=2, sticky="w", padx=(3, 12))
 
-        ttk.Label(recognition, text="Порог детектора:").grid(row=0, column=3, sticky="e", padx=(8, 5), pady=3)
+        ttk.Label(recognition, text="Порог обнаружения лица:").grid(row=0, column=3, sticky="e", padx=(8, 5), pady=3)
         ttk.Entry(recognition, textvariable=self.detector_threshold_var, width=8).grid(row=0, column=4, sticky="w", pady=3)
         hint(
             recognition,
@@ -264,14 +294,14 @@ class App(tk.Tk):
             "Практически полезный диапазон: 0.35…0.60. Значение по умолчанию: 0.45.",
         ).grid(row=1, column=2, sticky="w", padx=(3, 12))
 
-        ttk.Label(recognition, text="Отрыв от 2-го ребёнка:").grid(row=1, column=3, sticky="e", padx=(8, 5), pady=3)
+        ttk.Label(recognition, text="Мин. отрыв от другой цели:").grid(row=1, column=3, sticky="e", padx=(8, 5), pady=3)
         ttk.Entry(recognition, textvariable=self.margin_var, width=8).grid(row=1, column=4, sticky="w", pady=3)
         hint(
             recognition,
-            "Минимальный отрыв между лучшим ребёнком и следующим ДРУГИМ ребёнком. Допустимый диапазон ввода: 0.00…0.50.\n"
+            "Минимальный отрыв между лучшей целью и следующей ДРУГОЙ целью. Допустимый диапазон ввода: 0.00…0.50.\n"
             "Если фактическая разница меньше этого значения, совпадение не назначается автоматически и уходит в review.csv.\n"
             "0.00 — отключает этот дополнительный фильтр.\n"
-            "Практически полезный диапазон: 0.02…0.08. Значение по умолчанию: 0.04. Два эталона одного ребёнка здесь не конкурируют друг с другом.",
+            "Практически полезный диапазон: 0.02…0.08. Значение по умолчанию: 0.04. Два эталона одной цели здесь не конкурируют друг с другом.",
         ).grid(row=1, column=5, sticky="w", padx=(3, 12))
 
         quality = ttk.LabelFrame(outer, text="Что считать неудачным фото", padding=10)
@@ -281,7 +311,7 @@ class App(tk.Tk):
 
         q1 = ttk.Checkbutton(quality, text="Отбраковывать закрытые/сильно прищуренные глаза", variable=self.closed_eyes_var)
         q1.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=3)
-        add_tooltip(q1, "Если включено, распознанный ребёнок будет исключён из result.csv при подозрении на закрытые или сильно прищуренные глаза и попадёт в rejected.csv. Числовой порог задаётся выбранным пресетом качества: 0.080 / 0.105 / 0.125 для Мягкий / Нормальный / Строгий. Проверка эвристическая.")
+        add_tooltip(q1, "Если включено, распознанная цель будет исключена из result.csv при подозрении на закрытые или сильно прищуренные глаза и попадёт в rejected.csv. Числовой порог задаётся выбранным пресетом качества: 0.080 / 0.105 / 0.125 для Мягкий / Нормальный / Строгий. Проверка эвристическая.")
 
         q2 = ttk.Checkbutton(quality, text="Отбраковывать нерезкие лица", variable=self.blur_var)
         q2.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=3)
@@ -299,9 +329,13 @@ class App(tk.Tk):
         q5.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=3)
         add_tooltip(q5, "Если включено, лица с сильным пересветом или провалом в тени исключаются из result.csv и записываются в rejected.csv. Используется доля пересвеченных/проваленных пикселей в области лица. Порог по пресетам: до 0.70 / 0.55 / 0.35 для Мягкий / Нормальный / Строгий. По умолчанию выключено, потому что критерий заметно зависит от конкретной съёмки.")
 
+        q6 = ttk.Checkbutton(quality, text="Отбраковывать обрезанную/слишком близкую к краю голову", variable=self.head_clip_var)
+        q6.grid(row=1, column=2, sticky="w", pady=3)
+        add_tooltip(q6, "Проверяет не только физическое пересечение головы с краем фотографии, но и композиционный отступ от края. Отступ адаптивный: чем меньшую долю кадра занимает лицо, тем дальше оно должно находиться от границы — это помогает исключать людей, случайно попавших сбоку/сверху кадра. Для крупного портрета требуемый отступ автоматически уменьшается. Строгость зависит от пресета качества.")
+
         quality_note = ttk.Label(
             quality,
-            text="Важно: включённый критерий качества исключает распознанного ребёнка из основного CSV для этого фото и записывает причину в *_rejected.csv.",
+            text="Важно: включённый критерий качества исключает распознанную цель из основного CSV для этого фото и записывает причину в *_rejected.csv.",
             wraplength=930,
         )
         quality_note.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -321,7 +355,7 @@ class App(tk.Tk):
             "Практически полезный диапазон: 4…8 для большинства ПК. Значение по умолчанию подбирается автоматически.",
         ).grid(row=0, column=2, sticky="w", padx=(3, 15))
 
-        ttk.Label(performance, text="GPU inference-потоки:").grid(row=0, column=3, sticky="e", padx=(8, 5), pady=3)
+        ttk.Label(performance, text="Параллельные GPU-сеансы:").grid(row=0, column=3, sticky="e", padx=(8, 5), pady=3)
         inference_spin = ttk.Spinbox(performance, from_=1, to=8, textvariable=self.inference_workers_var, width=7)
         inference_spin.grid(row=0, column=4, sticky="w", pady=3)
         hint(
@@ -343,12 +377,32 @@ class App(tk.Tk):
         c3.grid(row=1, column=4, columnspan=4, sticky="w", pady=3)
         add_tooltip(c3, "Показывает в журнале: сколько лиц найдено полным кадром, сколько добавили тайлы, сколько осталось после NMS, сколько принято/отбраковано/отправлено на проверку.")
 
+        c4 = ttk.Checkbutton(
+            performance,
+            text="Определять серии фотографий и выбирать лучший кадр для каждой цели",
+            variable=self.best_series_var,
+        )
+        c4.grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 2))
+        add_tooltip(
+            c4,
+            "Создаёт дополнительный *_best.csv и не изменяет полный result.csv. "
+            "Серии определяются отдельно для каждой распознанной цели по последовательности кадров: "
+            "одна папка/камера, разрыв до 12 секунд и до 5 номеров файла. "
+            "Одиночные найденные кадры тоже сохраняются как серия из одного кадра. "
+            "Лучший кадр выбирается с приоритетом открытых глаз, затем резкости лица, "
+            "уверенности распознавания, ракурса и уверенности детектора. "
+            "Личность внутри серии не кластеризуется заново — используется уже подтверждённая цель ChildFaceFinder.",
+        )
+
         buttons = ttk.Frame(outer)
         buttons.grid(row=7, column=0, columnspan=3, sticky="ew", pady=4)
-        self.start_btn = ttk.Button(buttons, text="Начать", command=self._start)
+        self.start_btn = ttk.Button(buttons, text="НАЧАТЬ АНАЛИЗ", command=self._start)
         self.start_btn.pack(side="left")
         self.cancel_btn = ttk.Button(buttons, text="Отмена", command=self._cancel, state="disabled")
         self.cancel_btn.pack(side="left", padx=8)
+        self.collect_btn = ttk.Button(buttons, text="Собрать файлы по CSV…", command=self._collect_files)
+        self.collect_btn.pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Рекомендуемые значения", command=self._reset_recommended).pack(side="left", padx=(0, 8))
         ttk.Label(buttons, textvariable=self.status_var).pack(side="left", padx=12)
 
         self.progress = ttk.Progressbar(outer, variable=self.progress_var, maximum=100.0)
@@ -363,6 +417,7 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=sb.set)
+        ttk.Button(log_frame, text="Очистить", command=self._clear_log).grid(row=1, column=0, sticky="e", pady=(5, 0))
 
         ttk.Label(
             outer,
@@ -392,11 +447,144 @@ class App(tk.Tk):
         if value:
             self.output_var.set(value)
 
+    def _collect_files(self) -> None:
+        if self.worker and self.worker.is_alive():
+            return
+
+        initial_csv_dir = ""
+        initial_csv_file = ""
+        current_output = self.output_var.get().strip()
+        if current_output:
+            candidate = Path(current_output).expanduser()
+            initial_csv_dir = str(candidate.parent)
+            initial_csv_file = candidate.name
+        csv_value = filedialog.askopenfilename(
+            title="CSV с найденными целями",
+            filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
+            initialdir=initial_csv_dir or None,
+            initialfile=initial_csv_file or None,
+        )
+        if not csv_value:
+            return
+
+        source_value = self.photos_var.get().strip()
+        if not source_value:
+            source_value = filedialog.askdirectory(
+                title="Корневая папка исходных фотографий",
+            )
+            if not source_value:
+                return
+        else:
+            source_candidate = Path(source_value).expanduser()
+            if not source_candidate.is_dir():
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Папка фотографий, указанная в основном интерфейсе, больше не существует.\n"
+                    "Исправьте поле «Папка фотографий» или очистите его, чтобы выбрать папку при сборке.",
+                    parent=self,
+                )
+                return
+
+        destination_value = filedialog.askdirectory(
+            title="Каталог, где создать подпапки целей",
+            initialdir=str(Path(csv_value).parent),
+        )
+        if not destination_value:
+            return
+
+        csv_path = Path(csv_value)
+        source_root = Path(source_value)
+        destination_root = Path(destination_value)
+        self.start_btn.configure(state="disabled")
+        self.collect_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.collector_cancel_event = threading.Event()
+        cancel_event = self.collector_cancel_event
+        self.status_var.set("Сбор файлов…")
+        self.progress_var.set(0.0)
+        self._append_log(f"Сборщик: CSV={csv_path}")
+        self._append_log(f"Сборщик: исходники={source_root}")
+        self._append_log(f"Сборщик: назначение={destination_root}")
+
+        def collector_progress(done: int, total: int, name: str) -> None:
+            self.events.put(("collector_progress", done, total, name))
+
+        def task() -> None:
+            try:
+                summary = collect_from_csv(
+                    csv_path,
+                    source_root,
+                    destination_root,
+                    progress=collector_progress,
+                    cancel_check=cancel_event.is_set,
+                )
+                self.events.put(("collector_done", summary))
+            except Exception as exc:
+                self.events.put(("collector_error", str(exc), traceback.format_exc()))
+
+        self.worker = threading.Thread(target=task, name="cff-collector", daemon=True)
+        self.worker.start()
+
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert("end", text.rstrip() + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _clear_log(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def _reset_recommended(self) -> None:
+        self.search_mode_var.set("Улучшенный")
+        self.detector_threshold_var.set("0.18")
+        self.quality_preset_var.set("Нормальный")
+        self.threshold_var.set("0.45")
+        self.margin_var.set("0.04")
+        self.closed_eyes_var.set(True)
+        self.blur_var.set(True)
+        self.pose_var.set(True)
+        self.small_face_var.set(True)
+        self.exposure_var.set(False)
+        self.head_clip_var.set(True)
+        self.decode_workers_var.set(max(2, min(8, os.cpu_count() or 4)))
+        self.inference_workers_var.set(2)
+        self.recursive_var.set(True)
+        self.require_gpu_var.set(True)
+        self.verbose_var.set(True)
+        self.best_series_var.set(False)
+        self.status_var.set("Восстановлены рекомендуемые значения")
+
+    def _settings_snapshot(self) -> dict[str, object]:
+        return {
+            "reference_folder": self.ref_var.get().strip(),
+            "photo_folder": self.photos_var.get().strip(),
+            "output_csv": self.output_var.get().strip(),
+            "search_mode": self.search_mode_var.get(),
+            "detector_threshold": self.detector_threshold_var.get(),
+            "quality_preset": self.quality_preset_var.get(),
+            "match_threshold": self.threshold_var.get(),
+            "ambiguity_margin": self.margin_var.get(),
+            "reject_closed_eyes": self.closed_eyes_var.get(),
+            "reject_blur": self.blur_var.get(),
+            "reject_pose": self.pose_var.get(),
+            "reject_small_face": self.small_face_var.get(),
+            "reject_exposure": self.exposure_var.get(),
+            "reject_head_clipping": self.head_clip_var.get(),
+            "decode_workers": int(self.decode_workers_var.get()),
+            "gpu_sessions": int(self.inference_workers_var.get()),
+            "recursive": self.recursive_var.get(),
+            "require_gpu": self.require_gpu_var.get(),
+            "verbose": self.verbose_var.get(),
+            "select_best_series": self.best_series_var.get(),
+        }
+
+    def _save_settings(self) -> None:
+        try:
+            save_user_settings(self._settings_snapshot())
+        except (OSError, ValueError, tk.TclError) as exc:
+            self._append_log(f"Настройки: не удалось сохранить: {exc}")
 
     @staticmethod
     def _parse_float(value: str, label: str, low: float, high: float) -> float:
@@ -413,8 +601,10 @@ class App(tk.Tk):
         search = SEARCH_MODES[self.search_mode_var.get()]
         return Settings(
             match_threshold=self._parse_float(self.threshold_var.get(), "Порог совпадения", 0.05, 1.0),
-            ambiguity_margin=self._parse_float(self.margin_var.get(), "Отрыв от второго ребёнка", 0.0, 0.5),
+            ambiguity_margin=self._parse_float(self.margin_var.get(), "Отрыв от второй цели", 0.0, 0.5),
             detector_threshold=self._parse_float(self.detector_threshold_var.get(), "Порог детектора", 0.05, 0.8),
+            rescue_detector_threshold=min(self._parse_float(self.detector_threshold_var.get(), "Порог детектора", 0.05, 0.8), search["rescue_detector_threshold"]),
+            rescue_max_candidates=search["rescue_max_candidates"],
             min_face_px=quality["min_face_px"],
             max_yaw=quality["max_yaw"],
             max_pitch=quality["max_pitch"],
@@ -427,6 +617,13 @@ class App(tk.Tk):
             reject_pose=self.pose_var.get(),
             reject_small_face=self.small_face_var.get(),
             reject_exposure=self.exposure_var.get(),
+            reject_head_clipping=self.head_clip_var.get(),
+            head_top_margin_ratio=quality["head_top_margin_ratio"],
+            head_side_margin_ratio=quality["head_side_margin_ratio"],
+            chin_margin_ratio=quality["chin_margin_ratio"],
+            edge_guard_base_ratio=quality["edge_guard_base_ratio"],
+            edge_guard_min_ratio=quality["edge_guard_min_ratio"],
+            edge_guard_max_ratio=quality["edge_guard_max_ratio"],
             tile_enabled=search["tile_enabled"],
             tile_size=search["tile_size"],
             tile_overlap=search["tile_overlap"],
@@ -436,6 +633,7 @@ class App(tk.Tk):
             recursive=self.recursive_var.get(),
             require_gpu=self.require_gpu_var.get(),
             verbose_diagnostics=self.verbose_var.get(),
+            select_best_series=self.best_series_var.get(),
         )
 
     def _validate_paths(self) -> tuple[Path, Path, Path]:
@@ -470,12 +668,15 @@ class App(tk.Tk):
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
             return
 
+        self._save_settings()
+
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
         self.progress_var.set(0)
         self.status_var.set("Инициализация…")
         self.start_btn.configure(state="disabled")
+        self.collect_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
 
         def log(text: str) -> None:
@@ -504,9 +705,16 @@ class App(tk.Tk):
             self.cancel_btn.configure(state="disabled")
             self.status_var.set("Отмена…")
             self._append_log("Запрошена отмена. Завершается текущая операция…")
+            return
+        if self.collector_cancel_event is not None and self.worker and self.worker.is_alive():
+            self.collector_cancel_event.set()
+            self.cancel_btn.configure(state="disabled")
+            self.status_var.set("Отмена сборки…")
+            self._append_log("Сборщик: запрошена отмена. Текущее копирование будет прервано, неполный файл удалён.")
 
     def _finish_ui(self) -> None:
         self.start_btn.configure(state="normal")
+        self.collect_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
         self.finder = None
         self.worker = None
@@ -529,9 +737,10 @@ class App(tk.Tk):
                     self.progress_var.set(100.0)
                     self.status_var.set("Готово")
                     self._append_log(
-                        f"Готово. Детей: {summary.reference_ids}; эталонных файлов: {summary.reference_files}; "
+                        f"Готово. Целей: {summary.reference_ids}; эталонных файлов: {summary.reference_files}; "
                         f"фото: {summary.photo_count}; совпадений: {summary.matched_pairs}; "
                         f"отбраковано: {summary.rejected_pairs}; на проверку: {summary.review_rows}."
+                        + (f" Лучших кадров серий: {summary.best_series_count}." if summary.best_csv is not None else "")
                     )
                     self._finish_ui()
                     if not self.closing_after_cancel:
@@ -540,9 +749,97 @@ class App(tk.Tk):
                             "Обработка завершена.\n\n"
                             f"Основной CSV:\n{summary.output_csv}\n\n"
                             f"Отбракованные:\n{summary.rejected_csv}\n\n"
-                            f"Сомнительные совпадения:\n{summary.review_csv}",
+                            f"Сомнительные совпадения:\n{summary.review_csv}"
+                            + (
+                                f"\n\nЛучшие кадры серий:\n{summary.best_csv}\n"
+                                f"Выбрано серий: {summary.best_series_count}"
+                                if summary.best_csv is not None else ""
+                            ),
                             parent=self,
                         )
+                elif kind == "collector_progress":
+                    _, done, total, name = event
+                    if total > 0:
+                        if self.collector_indeterminate:
+                            self.progress.stop()
+                            self.progress.configure(mode="determinate")
+                            self.collector_indeterminate = False
+                        self.progress_var.set(done * 100.0 / total)
+                        self.status_var.set(f"Сбор файлов: {done}/{total}: {name}")
+                    else:
+                        if not self.collector_indeterminate:
+                            self.progress.configure(mode="indeterminate")
+                            self.progress.start(12)
+                            self.collector_indeterminate = True
+                        self.status_var.set(f"Сбор файлов: {name}")
+                elif kind == "collector_done":
+                    summary: CollectorSummary = event[1]
+                    if self.collector_indeterminate:
+                        self.progress.stop()
+                        self.progress.configure(mode="determinate")
+                        self.collector_indeterminate = False
+                    self.start_btn.configure(state="normal")
+                    self.collect_btn.configure(state="normal")
+                    self.cancel_btn.configure(state="disabled")
+                    self.worker = None
+                    self.collector_cancel_event = None
+                    if summary.cancelled:
+                        self.status_var.set("Сбор файлов отменён")
+                        self._append_log(
+                            f"Сборщик отменён. Успело скопироваться={summary.copied}; пропущено={summary.skipped}; "
+                            f"ошибок={summary.errors}; папок целей={summary.target_count}. "
+                            f"Отчёт: {summary.report_csv}"
+                        )
+                        if self.closing_after_cancel:
+                            self.destroy()
+                            return
+                        messagebox.showinfo(
+                            APP_TITLE,
+                            "Сбор файлов отменён.\n\n"
+                            f"Успело скопироваться: {summary.copied}\n"
+                            f"Пропущено: {summary.skipped}\n"
+                            f"Ошибок: {summary.errors}\n\n"
+                            "Недокопированный файл удалён. Уже скопированные файлы сохранены.\n\n"
+                            f"Отчёт: {summary.report_csv}",
+                            parent=self,
+                        )
+                    else:
+                        self.progress_var.set(100.0)
+                        self.status_var.set("Сбор файлов завершён")
+                        self._append_log(
+                            f"Сборщик: скопировано={summary.copied}; пропущено={summary.skipped}; "
+                            f"ошибок={summary.errors}; папок целей={summary.target_count}."
+                        )
+                        if self.closing_after_cancel:
+                            self.destroy()
+                            return
+                        messagebox.showinfo(
+                            APP_TITLE,
+                            "Сбор файлов завершён.\n\n"
+                            f"Скопировано: {summary.copied}\n"
+                            f"Пропущено: {summary.skipped}\n"
+                            f"Ошибок: {summary.errors}\n\n"
+                            f"Отчёт: {summary.report_csv}",
+                            parent=self,
+                        )
+                elif kind == "collector_error":
+                    _, text, details = event
+                    if self.collector_indeterminate:
+                        self.progress.stop()
+                        self.progress.configure(mode="determinate")
+                        self.collector_indeterminate = False
+                    self.status_var.set("Ошибка сборщика")
+                    self._append_log(details)
+                    self.start_btn.configure(state="normal")
+                    self.collect_btn.configure(state="normal")
+                    self.cancel_btn.configure(state="disabled")
+                    self.worker = None
+                    self.collector_cancel_event = None
+                    if self.closing_after_cancel:
+                        self.destroy()
+                        return
+                    if not self.closing_after_cancel:
+                        messagebox.showerror(APP_TITLE, text, parent=self)
                 elif kind == "cancelled":
                     self.status_var.set("Отменено")
                     self._append_log(event[1])
@@ -560,6 +857,7 @@ class App(tk.Tk):
             self.after(100, self._poll_events)
 
     def _on_close(self) -> None:
+        self._save_settings()
         if self.worker and self.worker.is_alive():
             self.closing_after_cancel = True
             self._cancel()

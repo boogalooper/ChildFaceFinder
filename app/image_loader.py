@@ -34,6 +34,7 @@ HEIF_EXTENSIONS = {".heic", ".heif", ".avif"}
 # встроенный JPEG-preview камеры; если он слишком мал/отсутствует — быстрый
 # half-size postprocess. Итоговую рабочую копию ограничиваем по длинной стороне.
 RAW_WORKING_MAX_SIDE = 4096
+RASTER_WORKING_MAX_SIDE = 6000
 RAW_EMBEDDED_PREVIEW_MIN_SIDE = 2400
 
 # Файлы этих типов читаются напрямую. RAW использует embedded preview/half-size
@@ -175,14 +176,29 @@ def iter_candidate_files(folder: Path, recursive: bool = True) -> list[Path]:
     )
 
 
-def _pil_to_bgr(path: Path) -> np.ndarray:
+def _pil_to_bgr(path: Path, max_side: int = RASTER_WORKING_MAX_SIDE) -> np.ndarray:
     with Image.open(path) as img:
-        img = ImageOps.exif_transpose(img)
         # Для анимированных форматов используем первый кадр.
         try:
             img.seek(0)
         except Exception:
             pass
+
+        # JPEG draft просит декодер сразу читать уменьшенную DCT-копию. На
+        # 40–60 МП JPEG это заметно снижает RAM и CPU до создания numpy-массива.
+        # Для остальных Pillow-форматов thumbnail всё равно ограничивает рабочий
+        # массив до разумного размера перед передачей в OpenCV/InsightFace.
+        if max_side > 0 and max(img.size) > max_side:
+            scale = max_side / float(max(img.size))
+            target = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+            try:
+                img.draft("RGB", target)
+            except Exception:
+                pass
+
+        img = ImageOps.exif_transpose(img)
+        if max_side > 0 and max(img.size) > max_side:
+            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
         rgb = img.convert("RGB")
         arr = np.asarray(rgb, dtype=np.uint8)
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
@@ -286,10 +302,11 @@ def decode_image(path: Path, temp_dir: Path) -> np.ndarray:
     Декодирует изображение в BGR uint8.
 
     RAW обрабатывается по быстрому пути: embedded JPEG-preview, затем при
-    необходимости half-size LibRaw. Рабочая копия ограничивается 4096 px по
-    длинной стороне и не требует промежуточного JPEG на диске.
+    необходимости half-size LibRaw. Рабочая RAW-копия ограничивается 4096 px.
+    Обычные растровые файлы ограничиваются 6000 px по длинной стороне; JPEG
+    по возможности использует decoder-side draft до создания numpy-массива.
 
-    HEIF/HEIC/AVIF и неизвестные форматы сохраняют прежнюю нормализацию через
+    HEIF/HEIC/AVIF и неизвестные форматы сохраняют нормализацию через
     системную TEMP-папку. Неизвестные расширения сначала пробуются Pillow,
     затем LibRaw.
     """
