@@ -37,3 +37,14 @@ def test_installer_inline_python_survives_windows_powershell_quoting():
     assert "struct.calcsize('P')" in install
     assert 'os.environ["APP_EXPECTED_VENV"]' not in install
     assert "os.environ['APP_EXPECTED_VENV']" in install
+
+
+def test_venv_is_created_and_repaired_as_relocatable():
+    install = (ROOT / "setup" / "install.ps1").read_text(encoding="utf-8-sig")
+    repair = (ROOT / "setup" / "repair_venv.ps1").read_text(encoding="utf-8-sig")
+    assert "--relocatable" in install
+    assert "--relocatable" in repair
+    assert "--allow-existing" in repair
+    assert "--no-python-downloads" in repair
+    assert "NativeCommandError" in repair
+    assert "Move-Item -LiteralPath $tmp" not in repair

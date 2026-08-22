@@ -474,7 +474,7 @@ try {
         $VenvReplacementStarted = $true
     }
 
-    Invoke-Native -FilePath $UvExe -Arguments @('venv', $VenvDir, '--python', $ManagedPythonExe)
+    Invoke-Native -FilePath $UvExe -Arguments @('venv', $VenvDir, '--python', $ManagedPythonExe, '--relocatable')
 
     if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
         throw "venv was created but python.exe was not found at: $PythonExe"
@@ -482,6 +482,11 @@ try {
     $VenvPythonW = Join-Path $VenvDir 'Scripts\pythonw.exe'
     if (-not (Test-Path -LiteralPath $VenvPythonW -PathType Leaf)) {
         throw "venv was created but pythonw.exe was not found at: $VenvPythonW"
+    }
+    $VenvConfig = Join-Path $VenvDir 'pyvenv.cfg'
+    $VenvConfigText = [System.IO.File]::ReadAllText($VenvConfig)
+    if ($VenvConfigText -notmatch '(?im)^relocatable\s*=\s*true\s*$') {
+        throw 'venv was created without relocatable mode.'
     }
     $env:APP_EXPECTED_VENV = $VenvDir
     try {
