@@ -145,7 +145,10 @@ function Get-FreeSpaceGB {
 
 function Write-VenvTransactionMarker {
     param([string]$BackupPath)
-    $value = if ($BackupPath) { $BackupPath } else { '__NONE__' }
+    # Store only the backup directory name. An absolute path would make crash
+    # recovery fail if the whole project is renamed or moved before the next
+    # installer run.
+    $value = if ($BackupPath) { [System.IO.Path]::GetFileName($BackupPath) } else { '__NONE__' }
     [System.IO.File]::WriteAllText($VenvTransactionFile, $value, [System.Text.Encoding]::UTF8)
 }
 
@@ -169,13 +172,16 @@ function Recover-InterruptedVenvTransaction {
         return
     }
 
-    $backupFull = [System.IO.Path]::GetFullPath($marker)
     $projectFull = [System.IO.Path]::GetFullPath($ProjectDir).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
-    $backupParent = [System.IO.Path]::GetDirectoryName($backupFull).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
-    $backupName = [System.IO.Path]::GetFileName($backupFull)
-    if ($backupParent -ne $projectFull -or -not $backupName.StartsWith('venv.previous.', [System.StringComparison]::OrdinalIgnoreCase)) {
+    $backupName = [System.IO.Path]::GetFileName($marker)
+    if (-not $backupName.StartsWith('venv.previous.', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Invalid venv transaction marker: $marker. Remove $VenvTransactionFile manually after checking the project folder."
     }
+
+    # New markers are relative. For a marker written by an older build, ignore
+    # its obsolete parent after a project move and safely resolve the validated
+    # backup basename inside the current project directory.
+    $backupFull = Join-Path $projectFull $backupName
 
     if (Test-Path -LiteralPath $backupFull) {
         if (Test-Path -LiteralPath $VenvDir) {
@@ -229,6 +235,7 @@ try {
 
     $requiredFiles = @(
         $Requirements,
+        (Join-Path $SetupDir 'repair_venv.ps1'),
         (Join-Path $AppDir 'check_install.py'),
         (Join-Path $AppDir 'model_setup.py'),
         (Join-Path $AppDir 'smoke_gpu.py')
