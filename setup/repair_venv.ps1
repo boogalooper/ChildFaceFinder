@@ -51,15 +51,18 @@ function Invoke-NativeCommand {
 }
 
 function Test-VenvPython {
+    param([Parameter(Mandatory = $true)][string]$ExpectedBaseHome)
     $env:APP_EXPECTED_VENV = $VenvDir
+    $env:APP_EXPECTED_BASE = $ExpectedBaseHome
     try {
         return Test-NativeCommand -FilePath $VenvPython -Arguments @(
             '-c',
-            "import os,pathlib,struct,sys; expected=pathlib.Path(os.environ['APP_EXPECTED_VENV']).resolve(); assert sys.version_info[:3]==(3,11,16); assert struct.calcsize('P')==8; assert pathlib.Path(sys.prefix).resolve()==expected"
+            "import os,pathlib,struct,sys; expected=pathlib.Path(os.environ['APP_EXPECTED_VENV']).resolve(); base=pathlib.Path(os.environ['APP_EXPECTED_BASE']).resolve(); assert sys.version_info[:3]==(3,11,16); assert struct.calcsize('P')==8; assert pathlib.Path(sys.prefix).resolve()==expected; assert pathlib.Path(sys.base_prefix).resolve()==base"
         )
     }
     finally {
         Remove-Item Env:APP_EXPECTED_VENV -ErrorAction SilentlyContinue
+        Remove-Item Env:APP_EXPECTED_BASE -ErrorAction SilentlyContinue
     }
 }
 
@@ -85,26 +88,24 @@ if (-not (Test-NativeCommand -FilePath $BasePython -Arguments @('-c', "import st
 }
 
 $ConfigText = [System.IO.File]::ReadAllText($ConfigPath)
-$HomeMatch = [regex]::Match($ConfigText, '(?im)^home\s*=\s*(.+)$')
-$CurrentHome = if ($HomeMatch.Success) { $HomeMatch.Groups[1].Value.Trim() } else { '' }
-$HomeMoved = -not [string]::Equals($CurrentHome, $BaseHome, [System.StringComparison]::OrdinalIgnoreCase)
 $IsRelocatable = $ConfigText -match '(?im)^relocatable\s*=\s*true\s*$'
-$VenvWorks = Test-VenvPython
+$VenvWorks = Test-VenvPython -ExpectedBaseHome $BaseHome
 
-if ($HomeMoved -or -not $IsRelocatable -or -not $VenvWorks) {
+# A relocatable uv venv may intentionally store relative metadata in
+# pyvenv.cfg. Do not infer a folder move by comparing the raw `home` string.
+# If the interpreter starts with the expected sys.prefix/sys.base_prefix, the
+# environment is healthy regardless of how that path is represented in cfg.
+if (-not $IsRelocatable -or -not $VenvWorks) {
     if (-not (Test-Path -LiteralPath $UvExe -PathType Leaf)) {
         Write-Host 'Private uv is missing, so the local environment cannot be repaired in place. Run install.bat once.'
         exit 5
     }
 
-    if ($HomeMoved) {
-        Write-Host 'Program folder move detected; repairing the virtual-environment launcher in place...'
-    }
-    elseif (-not $IsRelocatable) {
+    if (-not $IsRelocatable) {
         Write-Host 'Upgrading the local environment for safe folder moves...'
     }
     else {
-        Write-Host 'Local virtual-environment launcher needs repair; rebuilding launcher files in place...'
+        Write-Host 'Local environment path changed or its launcher needs repair; rebuilding launcher files in place...'
     }
 
     $env:UV_PYTHON_INSTALL_DIR = $ManagedPythonRoot
@@ -129,15 +130,15 @@ if ($HomeMoved -or -not $IsRelocatable -or -not $VenvWorks) {
         exit 6
     }
 
-    if ($HomeMoved) {
-        Write-Host 'Program folder move repaired without reinstalling packages.'
-    }
-    elseif (-not $IsRelocatable) {
+    if (-not $IsRelocatable) {
         Write-Host 'Local environment upgraded to relocatable mode.'
+    }
+    else {
+        Write-Host 'Local environment launcher repaired without reinstalling packages.'
     }
 }
 
-if (-not (Test-VenvPython)) {
+if (-not (Test-VenvPython -ExpectedBaseHome $BaseHome)) {
     Write-Host 'Local Python environment validation failed. Run install.bat once.'
     exit 7
 }

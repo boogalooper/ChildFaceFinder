@@ -48,3 +48,13 @@ def test_venv_is_created_and_repaired_as_relocatable():
     assert "--no-python-downloads" in repair
     assert "NativeCommandError" in repair
     assert "Move-Item -LiteralPath $tmp" not in repair
+
+
+def test_relocatable_repair_validates_runtime_not_raw_home_text():
+    install = (ROOT / "setup" / "install.ps1").read_text(encoding="utf-8-sig")
+    repair = (ROOT / "setup" / "repair_venv.ps1").read_text(encoding="utf-8-sig")
+    assert "sys.base_prefix" in install
+    assert "sys.base_prefix" in repair
+    assert "APP_EXPECTED_BASE" in install
+    assert "APP_EXPECTED_BASE" in repair
+    assert "$HomeMoved" not in repair

@@ -489,10 +489,12 @@ try {
         throw 'venv was created without relocatable mode.'
     }
     $env:APP_EXPECTED_VENV = $VenvDir
+    $env:APP_EXPECTED_BASE = Split-Path -Parent $ManagedPythonExe
     try {
-        Invoke-Native -FilePath $PythonExe -Arguments @('-c', "import os,pathlib,struct,sys; expected=pathlib.Path(os.environ['APP_EXPECTED_VENV']).resolve(); assert sys.version_info[:3]==(3,11,16); assert struct.calcsize('P')==8; assert pathlib.Path(sys.prefix).resolve()==expected; print(sys.executable)")
+        Invoke-Native -FilePath $PythonExe -Arguments @('-c', "import os,pathlib,struct,sys; expected=pathlib.Path(os.environ['APP_EXPECTED_VENV']).resolve(); base=pathlib.Path(os.environ['APP_EXPECTED_BASE']).resolve(); assert sys.version_info[:3]==(3,11,16); assert struct.calcsize('P')==8; assert pathlib.Path(sys.prefix).resolve()==expected; assert pathlib.Path(sys.base_prefix).resolve()==base; print(sys.executable)")
     } finally {
         Remove-Item Env:APP_EXPECTED_VENV -ErrorAction SilentlyContinue
+        Remove-Item Env:APP_EXPECTED_BASE -ErrorAction SilentlyContinue
     }
 
     Write-Host '[4/7] Installing runtime dependencies...'
