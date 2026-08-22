@@ -4,6 +4,7 @@ cd /d "%~dp0"
 title Child Face Finder launcher
 
 echo [Child Face Finder] Starting...
+echo Project: %CD%
 echo [1/3] Checking private CPython 3.11.16 environment...
 
 if not exist "venv\Scripts\python.exe" goto :not_installed
@@ -27,16 +28,25 @@ exit /b 0
 
 :not_installed
 echo.
-echo Private Python environment is not installed yet.
-echo Run install.bat once. It will download uv and its own CPython 3.11.16 x64.
-echo System Python is NOT required.
+echo Private Python environment is not ready in THIS program folder.
+echo Expected file:
+echo   %CD%\venv\Scripts\python.exe
+echo.
+if exist "tools\uv\uv.exe" echo Private uv is present, so a previous installation probably stopped before venv creation.
+if exist "tools\python" echo Private Python folder is present, so a previous installation probably stopped before venv creation.
+echo Run install.bat in this same folder and make sure it ends with:
+echo   Installation completed successfully.
+echo   Verified: ...\venv\Scripts\python.exe
+echo.
+echo Installer log: %CD%\childfacefinder_install.log
 pause
 exit /b 1
 
 :broken
 echo.
-echo The private Python environment could not be checked or repaired.
+echo The private Python environment exists but could not be checked or repaired.
 echo Run install.bat once to rebuild it. System Python is NOT required.
+echo Installer log: %CD%\childfacefinder_install.log
 pause
 exit /b 1
 

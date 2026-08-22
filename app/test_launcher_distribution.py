@@ -26,3 +26,14 @@ def test_launcher_repair_is_self_locating():
     assert "-ProjectDir" not in console
     assert not repair.lstrip().lower().startswith("param(")
     assert "$PSScriptRoot" in repair
+
+
+def test_installer_inline_python_survives_windows_powershell_quoting():
+    install = (ROOT / "setup" / "install.ps1").read_text(encoding="utf-8-sig")
+    # Windows PowerShell strips nested double quotes when forwarding native
+    # executable arguments. Python string literals inside -c therefore use
+    # single quotes, which are ordinary characters to cmd/PowerShell.
+    assert 'struct.calcsize("P")' not in install
+    assert "struct.calcsize('P')" in install
+    assert 'os.environ["APP_EXPECTED_VENV"]' not in install
+    assert "os.environ['APP_EXPECTED_VENV']" in install

@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
 # If this script was started from a 32-bit host on 64-bit Windows, relaunch
@@ -19,6 +19,8 @@ $SetupDir = $PSScriptRoot
 $ProjectDir = Split-Path -Parent $SetupDir
 $AppDir = Join-Path $ProjectDir 'app'
 Set-Location -LiteralPath $ProjectDir
+$InstallLog = Join-Path $ProjectDir 'childfacefinder_install.log'
+try { Start-Transcript -LiteralPath $InstallLog -Force | Out-Null } catch { }
 
 $UvVersion = '0.12.5'
 $PythonVersion = '3.11.16'
@@ -46,6 +48,7 @@ catch {
 # Keep uv-managed Python inside the project. Do not modify the system Python.
 $env:UV_PYTHON_INSTALL_DIR = $PythonInstallDir
 $env:UV_PYTHON_PREFERENCE = 'only-managed'
+$env:UV_PYTHON_INSTALL_BIN = '0'
 $env:UV_NO_CONFIG = '1'
 # Use the Windows certificate store too. This is more robust behind corporate
 # HTTPS proxies while retaining normal certificate verification.
@@ -96,6 +99,25 @@ function Invoke-WebDownloadWithRetry {
         }
     }
     throw "Download failed after $Attempts attempts: $($lastError.Message)"
+}
+
+function Find-ManagedPython {
+    if (-not (Test-Path -LiteralPath $PythonInstallDir -PathType Container)) {
+        return $null
+    }
+    $candidates = @(Get-ChildItem -LiteralPath $PythonInstallDir -Filter 'python.exe' -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.FullName -match 'cpython-3\.11\.16-windows-x86_64' -and
+            $_.Directory.FullName -notmatch '[\\/]Scripts$'
+        })
+    if ($candidates.Count -eq 1) {
+        return $candidates[0].FullName
+    }
+    if ($candidates.Count -gt 1) {
+        $preferred = @($candidates | Where-Object { $_.Directory.Name -like 'cpython-3.11.16-windows-x86_64*' })
+        if ($preferred.Count -eq 1) { return $preferred[0].FullName }
+    }
+    return $null
 }
 
 function Test-Uv {
@@ -424,7 +446,13 @@ try {
     Invoke-Native -FilePath $UvExe -Arguments @('--version')
 
     Write-Host '[2/7] Installing managed CPython...'
-    Invoke-Native -FilePath $UvExe -Arguments @('python', 'install', $PythonVersion)
+    Invoke-Native -FilePath $UvExe -Arguments @('python', 'install', '--no-bin', $PythonVersion)
+    $ManagedPythonExe = Find-ManagedPython
+    if (-not $ManagedPythonExe) {
+        throw "Managed CPython $PythonVersion x64 was not found under: $PythonInstallDir"
+    }
+    Write-Host "Managed Python: $ManagedPythonExe"
+    Invoke-Native -FilePath $ManagedPythonExe -Arguments @('-c', "import struct,sys; assert sys.version_info[:3] == (3,11,16); assert struct.calcsize('P') == 8; print(sys.executable)")
 
     Write-Host '[3/7] Creating venv...'
     if (Test-Path -LiteralPath $VenvDir) {
@@ -446,10 +474,20 @@ try {
         $VenvReplacementStarted = $true
     }
 
-    Invoke-Native -FilePath $UvExe -Arguments @('venv', $VenvDir, '--python', $PythonVersion)
+    Invoke-Native -FilePath $UvExe -Arguments @('venv', $VenvDir, '--python', $ManagedPythonExe)
 
     if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
-        throw 'venv was created but python.exe was not found.'
+        throw "venv was created but python.exe was not found at: $PythonExe"
+    }
+    $VenvPythonW = Join-Path $VenvDir 'Scripts\pythonw.exe'
+    if (-not (Test-Path -LiteralPath $VenvPythonW -PathType Leaf)) {
+        throw "venv was created but pythonw.exe was not found at: $VenvPythonW"
+    }
+    $env:APP_EXPECTED_VENV = $VenvDir
+    try {
+        Invoke-Native -FilePath $PythonExe -Arguments @('-c', "import os,pathlib,struct,sys; expected=pathlib.Path(os.environ['APP_EXPECTED_VENV']).resolve(); assert sys.version_info[:3]==(3,11,16); assert struct.calcsize('P')==8; assert pathlib.Path(sys.prefix).resolve()==expected; print(sys.executable)")
+    } finally {
+        Remove-Item Env:APP_EXPECTED_VENV -ErrorAction SilentlyContinue
     }
 
     Write-Host '[4/7] Installing runtime dependencies...'
@@ -492,6 +530,8 @@ try {
     Write-Host '============================================================'
     Write-Host 'Installation completed successfully.'
     Write-Host 'Start the application with run.bat.'
+    Write-Host "Verified launcher Python: $PythonExe"
+    Write-Host "Installer log: $InstallLog"
     Write-Host '============================================================'
 }
 catch {
@@ -538,6 +578,7 @@ catch {
     Write-Host 'INSTALLATION FAILED' -ForegroundColor Red
     Write-Host $InstallError.Message -ForegroundColor Red
     Write-Host 'Review the messages above for the failing step.' -ForegroundColor Red
+    Write-Host "Installer log: $InstallLog" -ForegroundColor Yellow
     Write-Host 'If a download/package step failed, retry install.bat after checking access to GitHub, PyPI and files.pythonhosted.org; the previous working venv is restored automatically when possible.' -ForegroundColor Yellow
     Write-Host 'If ONNX Runtime reports a missing DLL, install/update the Microsoft Visual C++ 2015-2022 x64 Redistributable.' -ForegroundColor Yellow
     Write-Host 'For RTX 50-series, use a current NVIDIA driver. CUDA 12.x requires at least driver 528.33 on Windows; a current driver is strongly recommended.' -ForegroundColor Yellow
@@ -546,6 +587,7 @@ catch {
     $ExitCode = 1
 }
 finally {
+    try { Stop-Transcript | Out-Null } catch { }
     # Always remove installer downloads and uv package cache from system TEMP.
     if (Test-Path -LiteralPath $TempRoot) {
         Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
