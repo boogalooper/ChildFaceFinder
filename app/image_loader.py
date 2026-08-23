@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import mmap
 import os
 import re
 import shutil
@@ -36,6 +37,17 @@ HEIF_EXTENSIONS = {".heic", ".heif", ".avif"}
 RAW_WORKING_MAX_SIDE = 4096
 RASTER_WORKING_MAX_SIDE = 6000
 RAW_EMBEDDED_PREVIEW_MIN_SIDE = 2400
+
+_JPEG_SOI = b"\xff\xd8"
+_JPEG_EOI = b"\xff\xd9"
+_JPEG_SOF_MARKERS = {
+    0xC0, 0xC1, 0xC2, 0xC3,
+    0xC5, 0xC6, 0xC7,
+    0xC9, 0xCA, 0xCB,
+    0xCD, 0xCE, 0xCF,
+}
+_MAX_EMBEDDED_JPEG_CANDIDATES = 8192
+_JPEG_HEADER_SCAN_BYTES = 512 * 1024
 
 # Файлы этих типов читаются напрямую. RAW использует embedded preview/half-size
 # в памяти; HEIF и некоторые неизвестные форматы сохраняют TEMP-нормализацию.
@@ -215,6 +227,117 @@ def _resize_max_side(image_bgr: np.ndarray, max_side: int = RAW_WORKING_MAX_SIDE
     return cv2.resize(image_bgr, new_size, interpolation=cv2.INTER_AREA)
 
 
+def _jpeg_dimensions(data: mmap.mmap, start: int, end: int) -> tuple[int, int] | None:
+    """Reads JPEG dimensions from marker headers without decoding pixels."""
+    pos = start + 2
+    while pos + 3 < end:
+        if data[pos] != 0xFF:
+            pos += 1
+            continue
+
+        while pos < end and data[pos] == 0xFF:
+            pos += 1
+        if pos >= end:
+            return None
+
+        marker = data[pos]
+        pos += 1
+
+        # Stand-alone markers have no segment length.
+        if marker in {0x01, 0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+
+        # Scan data starts after SOS; SOF must occur before it.
+        if marker == 0xDA:
+            return None
+
+        if pos + 2 > end:
+            return None
+        segment_length = (data[pos] << 8) | data[pos + 1]
+        if segment_length < 2 or pos + segment_length > end:
+            return None
+
+        if marker in _JPEG_SOF_MARKERS:
+            if segment_length < 7:
+                return None
+            height = (data[pos + 3] << 8) | data[pos + 4]
+            width = (data[pos + 5] << 8) | data[pos + 6]
+            if width > 0 and height > 0:
+                return width, height
+            return None
+
+        pos += segment_length
+
+    return None
+
+
+def _extract_largest_embedded_jpeg(path: Path, *, larger_than_area: int = 0) -> bytes | None:
+    """Finds the largest valid JPEG embedded inside a RAW container.
+
+    This is a fallback behind LibRaw/rawpy. Some recent RAW variants contain
+    several JPEG previews, while LibRaw may expose only a smaller one (or no
+    thumbnail at all). mmap keeps the scan memory-efficient for large RAW files.
+    """
+    try:
+        with path.open("rb") as file_obj:
+            with mmap.mmap(file_obj.fileno(), length=0, access=mmap.ACCESS_READ) as data:
+                candidates: list[tuple[int, int, int]] = []  # area, start, end
+                search_from = 0
+                checked = 0
+                file_size = len(data)
+
+                while checked < _MAX_EMBEDDED_JPEG_CANDIDATES:
+                    start = data.find(_JPEG_SOI, search_from)
+                    if start < 0:
+                        break
+                    checked += 1
+
+                    # FF D8 can occur randomly in sensor/compressed RAW data.
+                    # Validate the JPEG marker structure before accepting it.
+                    header_end = min(file_size, start + _JPEG_HEADER_SCAN_BYTES)
+                    dimensions = _jpeg_dimensions(data, start, header_end)
+                    if dimensions is not None:
+                        end_marker = data.find(_JPEG_EOI, start + 2)
+                        if end_marker >= 0:
+                            width, height = dimensions
+                            area = width * height
+                            if area > larger_than_area:
+                                candidates.append((area, start, end_marker + len(_JPEG_EOI)))
+
+                    # Continue after this SOI even when it was invalid; a random
+                    # marker must not hide a real embedded JPEG later in the file.
+                    search_from = start + len(_JPEG_SOI)
+
+                # Validate candidates with Pillow, starting from the largest.
+                for _area, start, end in sorted(candidates, reverse=True):
+                    jpeg = bytes(data[start:end])
+                    try:
+                        with Image.open(BytesIO(jpeg)) as image:
+                            if image.format != "JPEG":
+                                continue
+                            image.verify()
+                        return jpeg
+                    except Exception:
+                        continue
+                return None
+    except (OSError, ValueError):
+        return None
+
+
+def _jpeg_bytes_to_bgr(jpeg: bytes) -> np.ndarray | None:
+    """Decodes an embedded JPEG and applies its EXIF orientation."""
+    try:
+        with Image.open(BytesIO(jpeg)) as img:
+            img.load()
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            rgb = np.asarray(img, dtype=np.uint8)
+    except Exception:
+        return None
+    if rgb.size == 0:
+        return None
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
 def _embedded_raw_preview(path: Path) -> np.ndarray | None:
     """
     Извлекает готовый preview/thumbnail из RAW без проявки сенсорных данных.
@@ -262,13 +385,35 @@ def _raw_half_size_to_bgr(path: Path) -> np.ndarray:
 
 
 def _raw_to_bgr(path: Path) -> np.ndarray:
-    preview = _embedded_raw_preview(path)
-    if preview is not None and max(preview.shape[:2]) >= RAW_EMBEDDED_PREVIEW_MIN_SIDE:
-        return _resize_max_side(preview)
+    # LibRaw is still the primary/fast path. If it cannot expose a thumbnail,
+    # continue with a direct container scan before giving up and demosaicing.
+    try:
+        preview = _embedded_raw_preview(path)
+    except Exception:
+        preview = None
 
-    # Небольшой embedded thumbnail может быть слишком мал для групповых фото.
-    # В этом случае используем half-size RAW — медленнее preview, но гораздо
-    # быстрее полной проявки и достаточно детально для tiled face detection.
+    preview_area = 0
+    if preview is not None:
+        height, width = preview.shape[:2]
+        preview_area = int(height) * int(width)
+        if max(height, width) >= RAW_EMBEDDED_PREVIEW_MIN_SIDE:
+            return _resize_max_side(preview)
+
+    # A recent CR3/NEF/ARW/DNG may contain a larger embedded JPEG that LibRaw
+    # does not expose through extract_thumb(). Search for it before half-size
+    # RAW processing. Only candidates larger than LibRaw's preview are tried.
+    embedded_jpeg = _extract_largest_embedded_jpeg(path, larger_than_area=preview_area)
+    if embedded_jpeg is not None:
+        embedded_preview = _jpeg_bytes_to_bgr(embedded_jpeg)
+        if (
+            embedded_preview is not None
+            and max(embedded_preview.shape[:2]) >= RAW_EMBEDDED_PREVIEW_MIN_SIDE
+        ):
+            return _resize_max_side(embedded_preview)
+
+    # Child Face Finder deliberately keeps the existing minimum-size rule:
+    # a small thumbnail can miss faces in group photos. If no sufficiently
+    # large embedded preview exists, use half-size RAW as before.
     return _resize_max_side(_raw_half_size_to_bgr(path))
 
 
