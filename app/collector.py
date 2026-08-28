@@ -248,20 +248,28 @@ def collect_from_csv(
 
             source: Path | None = None
             reason = ""
-            if source_col is not None and len(row) > source_col:
-                source_text = row[source_col].strip()
-                source = _source_from_relative(source_root, source_text)
-                if source is None:
-                    reason = "исходный путь отсутствует или выходит за выбранную папку"
-            else:
-                assert stem_index is not None
-                candidates = stem_index.get(Path(photo_id).stem.casefold(), [])
-                if len(candidates) == 1:
-                    source = candidates[0]
-                elif not candidates:
-                    reason = "файл не найден по номеру фото"
+            if source_col is not None:
+                if len(row) <= source_col:
+                    reason = "неполная строка CSV: отсутствует исходный файл"
                 else:
-                    reason = "неоднозначное имя: найдено несколько файлов с таким stem"
+                    source_text = row[source_col].strip()
+                    source = _source_from_relative(source_root, source_text)
+                    if source is None:
+                        reason = "исходный путь отсутствует или выходит за выбранную папку"
+            else:
+                # Индекс по stem строится только для старых CSV без столбца
+                # «Исходный файл». Если столбец есть, неполная строка должна
+                # быть пропущена, а не переключать весь сборщик на другой режим.
+                if stem_index is None:
+                    reason = "внутренняя ошибка индекса исходных файлов"
+                else:
+                    candidates = stem_index.get(Path(photo_id).stem.casefold(), [])
+                    if len(candidates) == 1:
+                        source = candidates[0]
+                    elif not candidates:
+                        reason = "файл не найден по номеру фото"
+                    else:
+                        reason = "неоднозначное имя: найдено несколько файлов с таким stem"
 
             if source is None:
                 skipped += 1

@@ -1245,7 +1245,6 @@ class ChildFaceFinder:
 
                 for face, base_info in base_matches[analysis_index]:
                     person_id, best_id, dist, second_id, second_dist, match_problem = base_info
-                    used_info = base_info
                     recovered_by_anchor = False
 
                     # Только пограничные лица рассматриваются повторно. Требуем,
@@ -1264,7 +1263,6 @@ class ChildFaceFinder:
                             and expanded_dist <= dist - 0.015
                         ):
                             person_id = expanded_person
-                            used_info = expanded_info
                             best_id = expanded_best
                             dist = expanded_dist
                             second_id = expanded_second

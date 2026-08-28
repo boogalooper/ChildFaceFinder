@@ -7,7 +7,6 @@ import re
 import shutil
 import tempfile
 import time
-import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable
@@ -29,8 +28,6 @@ RAW_EXTENSIONS = {
     ".nef", ".nrw", ".orf", ".pef", ".ptx", ".pxn", ".r3d", ".raf",
     ".raw", ".rw2", ".rwl", ".rwz", ".sr2", ".srf", ".srw", ".x3f",
 }
-HEIF_EXTENSIONS = {".heic", ".heif", ".avif"}
-
 # RAW не проявляется в полном разрешении без необходимости. Сначала используем
 # встроенный JPEG-preview камеры; если он слишком мал/отсутствует — быстрый
 # half-size postprocess. Итоговую рабочую копию ограничиваем по длинной стороне.
@@ -48,14 +45,6 @@ _JPEG_SOF_MARKERS = {
 }
 _MAX_EMBEDDED_JPEG_CANDIDATES = 8192
 _JPEG_HEADER_SCAN_BYTES = 512 * 1024
-
-# Файлы этих типов читаются напрямую. RAW использует embedded preview/half-size
-# в памяти; HEIF и некоторые неизвестные форматы сохраняют TEMP-нормализацию.
-DIRECT_EXTENSIONS = {
-    ".jpg", ".jpeg", ".jpe", ".png", ".bmp", ".dib", ".tif", ".tiff",
-    ".webp", ".gif", ".ppm", ".pgm", ".pbm", ".pnm", ".ico",
-}
-
 
 SKIP_EXTENSIONS = {
     ".csv", ".txt", ".json", ".xml", ".yaml", ".yml", ".ini", ".log",
@@ -417,31 +406,6 @@ def _raw_to_bgr(path: Path) -> np.ndarray:
     return _resize_max_side(_raw_half_size_to_bgr(path))
 
 
-def _roundtrip_temp_jpeg(image_bgr: np.ndarray, temp_dir: Path) -> np.ndarray:
-    """
-    Нормализация через JPEG во временном каталоге ОС.
-    Файл удаляется в finally сразу после декодирования обратно.
-    """
-    temp_path = temp_dir / f"norm_{uuid.uuid4().hex}.jpg"
-    try:
-        ok, encoded = cv2.imencode(
-            ".jpg", image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 96]
-        )
-        if not ok:
-            raise ValueError("Не удалось закодировать временный JPEG")
-        temp_path.write_bytes(encoded.tobytes())
-        data = np.fromfile(str(temp_path), dtype=np.uint8)
-        normalized = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if normalized is None:
-            raise ValueError("Не удалось прочитать временный JPEG")
-        return normalized
-    finally:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
 def decode_image(path: Path, temp_dir: Path) -> np.ndarray:
     """
     Декодирует изображение в BGR uint8.
@@ -451,9 +415,9 @@ def decode_image(path: Path, temp_dir: Path) -> np.ndarray:
     Обычные растровые файлы ограничиваются 6000 px по длинной стороне; JPEG
     по возможности использует decoder-side draft до создания numpy-массива.
 
-    HEIF/HEIC/AVIF и неизвестные форматы сохраняют нормализацию через
-    системную TEMP-папку. Неизвестные расширения сначала пробуются Pillow,
-    затем LibRaw.
+    HEIF/HEIC/AVIF и другие форматы, которые понимает Pillow, декодируются
+    напрямую в память без промежуточного JPEG. Неизвестные расширения сначала
+    пробуются Pillow, затем LibRaw.
     """
     suffix = path.suffix.casefold()
 
@@ -461,10 +425,7 @@ def decode_image(path: Path, temp_dir: Path) -> np.ndarray:
         return _raw_to_bgr(path)
 
     try:
-        image = _pil_to_bgr(path)
-        if suffix in HEIF_EXTENSIONS or suffix not in DIRECT_EXTENSIONS:
-            image = _roundtrip_temp_jpeg(image, temp_dir)
-        return image
+        return _pil_to_bgr(path)
     except (UnidentifiedImageError, OSError, ValueError):
         # Некоторые RAW имеют необычные расширения. Последняя попытка — LibRaw.
         try:

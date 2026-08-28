@@ -107,16 +107,39 @@ def _recover_interrupted_model_swap() -> None:
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    if MODEL_DIR.exists():
+    if model_is_valid(MODEL_DIR):
         # A valid active model wins. Old backup leftovers are non-fatal and may
         # simply have been locked by antivirus during cleanup.
         return
 
-    for backup in backups:
-        if model_is_valid(backup):
-            backup.rename(MODEL_DIR)
-            print(f"Восстановлена модель после прерванной предыдущей установки: {MODEL_DIR}")
-            return
+    valid_backup = next((backup for backup in backups if model_is_valid(backup)), None)
+    if valid_backup is None:
+        return
+
+    # If an interrupted swap left a damaged active directory, move it aside
+    # first so a known-good previous model can be restored atomically.
+    damaged: Path | None = None
+    if MODEL_DIR.exists():
+        damaged = parent / f".{MODEL_NAME}.damaged.{uuid.uuid4().hex}"
+        MODEL_DIR.rename(damaged)
+
+    try:
+        valid_backup.rename(MODEL_DIR)
+    except Exception:
+        if damaged is not None and damaged.exists() and not MODEL_DIR.exists():
+            damaged.rename(MODEL_DIR)
+        raise
+
+    if damaged is not None and damaged.exists():
+        try:
+            if damaged.is_dir():
+                shutil.rmtree(damaged)
+            else:
+                damaged.unlink()
+        except OSError as exc:
+            print(f"Предупреждение: восстановлена рабочая модель, но повреждённую копию не удалось удалить: {damaged} ({exc})")
+
+    print(f"Восстановлена модель после прерванной предыдущей установки: {MODEL_DIR}")
 
 
 

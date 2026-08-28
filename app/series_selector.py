@@ -12,6 +12,15 @@ from PIL import Image
 _SEQUENCE_RE = re.compile(r"(\d+)(?!.*\d)")
 _DATE_FORMATS = ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S")
 
+# Formats for which LibRaw/rawpy is a useful metadata fallback when Pillow
+# cannot expose DateTimeOriginal. This list is deliberately conservative:
+# uncommon/unknown extensions still use the existing filename/mtime fallback.
+_RAW_METADATA_EXTENSIONS = {
+    ".3fr", ".arw", ".cr2", ".cr3", ".dng", ".erf", ".fff", ".iiq",
+    ".kdc", ".mef", ".mos", ".mrw", ".nef", ".nrw", ".orf", ".pef",
+    ".raf", ".raw", ".rw2", ".rwl", ".sr2", ".srf", ".srw", ".x3f",
+}
+
 
 @dataclass(slots=True)
 class BestFrameCandidate:
@@ -73,6 +82,23 @@ def _parse_date(value: object) -> datetime | None:
     return None
 
 
+def _read_raw_capture_time(path: Path) -> datetime | None:
+    if path.suffix.casefold() not in _RAW_METADATA_EXTENSIONS:
+        return None
+    try:
+        # Lazy import keeps this module lightweight in tests/tools that only use
+        # raster files. rawpy is already a required runtime dependency.
+        import rawpy
+
+        with rawpy.imread(str(path)) as raw:
+            timestamp = raw.other.timestamp
+        if isinstance(timestamp, datetime) and timestamp.year > 1971:
+            return timestamp
+    except Exception:
+        pass
+    return None
+
+
 def read_photo_order_info(path: Path) -> PhotoOrderInfo:
     capture_time: datetime | None = None
     metadata_time = False
@@ -87,6 +113,10 @@ def read_photo_order_info(path: Path) -> PhotoOrderInfo:
                         break
     except Exception:
         pass
+
+    if capture_time is None:
+        capture_time = _read_raw_capture_time(path)
+        metadata_time = capture_time is not None
 
     if capture_time is None:
         try:
