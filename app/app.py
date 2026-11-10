@@ -797,6 +797,8 @@ class App(tk.Tk):
             self._append_log("Сборщик: запрошена отмена. Текущее копирование будет прервано, неполный файл удалён.")
 
     def _finish_ui(self) -> None:
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
         self.start_btn.configure(state="normal")
         self.collect_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
@@ -815,8 +817,16 @@ class App(tk.Tk):
                     self._append_log(event[1])
                 elif kind == "progress":
                     _, done, total, name = event
-                    self.progress_var.set(0.0 if total <= 0 else done * 100.0 / total)
-                    self.status_var.set(f"{done}/{total}: {name}")
+                    if total <= 0:
+                        if str(self.progress.cget('mode')) != 'indeterminate':
+                            self.progress.configure(mode='indeterminate')
+                            self.progress.start(12)
+                        self.status_var.set(name)
+                    else:
+                        self.progress.stop()
+                        self.progress.configure(mode='determinate')
+                        self.progress_var.set(done * 100.0 / total)
+                        self.status_var.set(f"{done}/{total}: {name}")
                 elif kind == "done":
                     summary = event[1]
                     self.progress_var.set(100)

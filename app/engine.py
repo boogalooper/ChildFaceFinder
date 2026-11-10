@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from stage_progress import track
 import csv
 import math
 import os
@@ -1145,14 +1146,15 @@ class ChildFaceFinder:
             return None, best_id, best_dist, second_id, second_dist, "слишком близкая вторая цель"
         return best_id, best_id, best_dist, second_id, second_dist, None
 
-    @staticmethod
-    def _write_csv_atomic(path: Path, header: list[str], rows: list[list[object]]) -> None:
+    def _write_csv_atomic(self, path: Path, header: list[str], rows: list[list[object]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with atomic_path(path) as temp:
             with temp.open("w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f, delimiter=";", lineterminator="\n")
                 writer.writerow(header)
-                writer.writerows(rows)
+                for row in track(rows, self.progress, f"Запись CSV — {path.name}"):
+                    self._check_cancel()
+                    writer.writerow(row)
 
     @guarded_run
     def run(self, references_dir: Path | None, photos_dir: Path, output_csv: Path | None) -> RunSummary:
@@ -1173,6 +1175,18 @@ class ChildFaceFinder:
         for path, error in failed_temp:
             self.log(f"TEMP: не удалось удалить {path}: {error}")
 
+        photo_paths = iter_candidate_files(photos_dir, self.settings.recursive)
+        if references_dir is not None and references_dir != photos_dir:
+            photo_paths = [p for p in photo_paths if references_dir not in p.resolve().parents]
+        if not photo_paths:
+            raise RuntimeError("В папке фотографий нет файлов съёмки")
+        if xmp_enabled:
+            import embedded_xmp
+            if any(embedded_xmp.supports_embedded(p) for p in photo_paths):
+                self.log('Проверка чтения и записи встроенного XMP…')
+                embedded_xmp.self_test()
+                self._check_cancel()
+
         self.engine.initialize()
         self._check_cancel()
 
@@ -1181,11 +1195,6 @@ class ChildFaceFinder:
             self.log(f"Временный каталог ОС: {temp_dir}")
             references = self._build_references(references_dir, temp_dir) if references_dir is not None else None
 
-            photo_paths = iter_candidate_files(photos_dir, self.settings.recursive)
-            if references_dir is not None and references_dir != photos_dir:
-                photo_paths = [p for p in photo_paths if references_dir not in p.resolve().parents]
-            if not photo_paths:
-                raise RuntimeError("В папке фотографий нет файлов съёмки")
 
             analyses: list[ImageAnalysis] = []
             failed_analyses = []
@@ -1212,6 +1221,7 @@ class ChildFaceFinder:
 
             if not analyses:
                 raise RuntimeError("Ни одну фотографию не удалось обработать. Проверьте журнал; предыдущие результаты не изменены.")
+            self.progress(0, 0, "Подготовка результатов анализа…")
             analyses.sort(key=lambda a: (str(a.path).casefold(), str(a.path)))
             discovered = {}
             discovery_details = {}
@@ -1219,6 +1229,7 @@ class ChildFaceFinder:
                 def check_cancel():
                     if self.cancel_event.is_set():
                         raise CancelledError("Обработка отменена")
+                self.progress(0, 0, "Объединение уникальных лиц и сохранение каталога…")
                 names, vectors, discovered = assign_identities(
                     analyses, photos_dir, self.settings.match_threshold,
                     self.settings.ambiguity_margin, check_cancel,
@@ -1240,7 +1251,7 @@ class ChildFaceFinder:
             anchor_candidates: dict[str, list[tuple[float, np.ndarray]]] = defaultdict(list)
             anchor_limit_distance = min(0.34, max(0.18, self.settings.match_threshold - 0.06))
 
-            for analysis_index, analysis in enumerate(analyses):
+            for analysis_index, analysis in enumerate(track(analyses, self.progress, "Сопоставление лиц", lambda a: a.path.name)):
                 rows = []
                 for face in analysis.faces:
                     if self.cancel_event.is_set():
@@ -1274,6 +1285,7 @@ class ChildFaceFinder:
             extra_vectors: list[np.ndarray] = []
             extra_indices: list[int] = []
             person_index = {person: index for index, person in enumerate(references.person_ids)}
+            self.progress(0, 0, "Подготовка дополнительных образцов лиц…")
             for person, values in anchor_candidates.items():
                 values.sort(key=lambda item: item[0])
                 for _dist, vector in values[:8]:
@@ -1310,7 +1322,7 @@ class ChildFaceFinder:
             identified_faces = 0
             detected_faces = sum(len(analysis.faces) for analysis in analyses)
 
-            for analysis_index, analysis in enumerate(analyses):
+            for analysis_index, analysis in enumerate(track(analyses, self.progress, "Уточнение совпадений и отбор", lambda a: a.path.name)):
                 try:
                     relative_path = analysis.path.relative_to(photos_dir).as_posix()
                 except ValueError:
@@ -1457,6 +1469,7 @@ class ChildFaceFinder:
                     eye_open_threshold=self.settings.eye_ratio_min,
                     max_gap_seconds=self.settings.series_max_gap_seconds,
                     max_filename_gap=self.settings.series_max_filename_gap,
+                    progress=self.progress,
                     check_cancel=self._check_cancel,
                 )
                 self._check_cancel()
@@ -1507,6 +1520,7 @@ class ChildFaceFinder:
                     people_by_photo,
                     best_photo_paths if (workflow is not None or self.settings.xmp_mark_best) else set(),
                     all_photos=photo_paths,
+                    progress=self.progress,
                     preserve_photos={a.path for a in failed_analyses},
                     check_cancel=self._check_cancel,
                     **(dict(sync_people=True, write_people=workflow.people_enabled,
@@ -1547,7 +1561,7 @@ class ChildFaceFinder:
                 blocked = set()
                 if xmp_enabled and xmp_failed:
                     # Never move a file whose requested metadata update failed.
-                    blocked = xmp_summary.failed_photos
+                    blocked = xmp_summary.errors
                 self.log('Раскладка фотографий и XMP по папкам людей…')
                 transfer_summary = export_people(output_people, photos_dir, workflow.destination,
                     move=workflow.transfer == 'move', all_photos=photo_paths,

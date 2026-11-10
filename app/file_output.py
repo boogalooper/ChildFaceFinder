@@ -109,7 +109,8 @@ def export_people(people_by_photo, source_root, destination, *, move=False,
             if sidecar.is_symlink():
                 raise ValueError('XMP является ссылкой; перенос пропущен')
             if move and image in (blocked or set()):
-                raise ValueError('XMP не был успешно обновлён: исходник не перемещён')
+                reason = blocked.get(image, '') if isinstance(blocked, dict) else ''
+                raise ValueError('XMP не был успешно обновлён: исходник не перемещён' + (f'. Причина: {reason}' if reason else ''))
             if move and has_xmp and len(siblings.get((str(image.parent.resolve()).casefold(), image.stem.casefold()), ())) > 1:
                 raise ValueError('Общий XMP у нескольких изображений: перемещение пропущено')
             originals = [image] + ([sidecar] if has_xmp else [])

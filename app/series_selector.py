@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from stage_progress import track
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -422,6 +423,7 @@ def select_best_series_frames(
     max_gap_seconds: float = 12.0,
     max_filename_gap: int = 5,
     check_cancel: Callable[[], None] | None = None,
+    progress=lambda done, total, name: None,
 ) -> list[BestSeriesSelection]:
     by_person: dict[str, list[BestFrameCandidate]] = {}
     all_candidates = list(candidates)
@@ -430,7 +432,7 @@ def select_best_series_frames(
 
     info_cache: dict[Path, PhotoOrderInfo] = {}
     targets_by_path: dict[Path, set[str]] = {}
-    for candidate in all_candidates:
+    for candidate in track(all_candidates, progress, "Серии — чтение времени съёмки", lambda c: c.path.name):
         if check_cancel:
             check_cancel()
         if candidate.path not in info_cache:
@@ -438,7 +440,7 @@ def select_best_series_frames(
         targets_by_path.setdefault(candidate.path, set()).add(candidate.person_id)
 
     selections: list[BestSeriesSelection] = []
-    for person_id in sorted(by_person, key=str.casefold):
+    for person_id in track(sorted(by_person, key=str.casefold), progress, "Выбор лучших кадров", str):
         if check_cancel:
             check_cancel()
         groups = split_target_series(

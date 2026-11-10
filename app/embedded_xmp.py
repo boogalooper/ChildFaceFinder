@@ -55,6 +55,8 @@ def write(path, packet, expected_digest, cancel=None):
         with backend().ImageData(temp.read_bytes()) as image:
             if image.read_xmp() != expected_tags:
                 raise RuntimeError('Проверка встроенного XMP не пройдена')
+        # Preserve mtime: series ordering may use it when capture EXIF is absent.
+        shutil.copystat(path, temp)
         if fingerprint(path, cancel) != expected_digest:
             raise RuntimeError('Фотография изменена другим процессом; запись отменена')
 

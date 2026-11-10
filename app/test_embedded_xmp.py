@@ -70,3 +70,65 @@ def test_unicode_paths_never_reach_native_filename_api(tmp_path, monkeypatch):
     assert result.written_files == 1 and not result.failed_files
     assert 'Алёна' in embedded_xmp.read(path).decode('utf-8')
     embedded_xmp.self_test()
+
+
+def test_embedded_write_preserves_mtime_and_compressed_jpeg(tmp_path):
+    import os
+    path = tmp_path/'photo.jpg';Image.new('RGB',(32,32),(50,90,30)).save(path)
+    os.utime(path, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
+    before = path.read_bytes();stamp=path.stat().st_mtime_ns
+    result=XmpMetadataWriter().export({path:{'Иван'}},sync_people=True,legacy_best=False)
+    assert result.written_files == 1
+    assert path.stat().st_mtime_ns == stamp
+    # The scan including compressed image data is byte-identical, not just pixels.
+    assert before[before.index(b'\xff\xda'):] == path.read_bytes()[path.read_bytes().index(b'\xff\xda'):]
+
+
+def test_preflight_stops_before_inference(engine_module, monkeypatch, tmp_path):
+    import embedded_xmp
+    from workflow import WorkflowOptions
+    source=tmp_path/'photos';source.mkdir()
+    image=source/'photo.jpg';Image.new('RGB',(8,8)).save(image)
+    runner=engine_module.ChildFaceFinder(engine_module.Settings(workflow=WorkflowOptions(scenario='discover',output='analysis',xmp_enabled=True)))
+    def fail(): raise RuntimeError('XMP backend broken')
+    monkeypatch.setattr(embedded_xmp,'self_test',fail)
+    def inference(): pytest.fail('Models must not be initialized after failed preflight')
+    runner.engine.initialize=inference
+    with pytest.raises(RuntimeError,match='XMP backend broken'):
+        runner.run(None,source,None)
+
+
+def test_move_journal_contains_original_xmp_error(tmp_path):
+    import json
+    source=tmp_path/'photos';source.mkdir()
+    path=source/'bad.jpg';path.write_bytes(b'broken')
+    result=XmpMetadataWriter().export({path:{'A'}},sync_people=True)
+    assert result.errors[path]
+    transfer=export_people({path:{'A'}},source,tmp_path/'out',move=True,blocked=result.errors)
+    error=json.loads(transfer.journal.read_text())['items'][0]['error']
+    assert result.errors[path] in error
+    assert path.read_bytes()==b'broken'
+
+
+def test_cancelled_embedded_write_preserves_original(tmp_path):
+    import embedded_xmp
+    path=tmp_path/'photo.jpg';Image.new('RGB',(8,8)).save(path)
+    original=path.read_bytes()
+    digest=embedded_xmp.fingerprint(path)
+    def cancel(): raise RuntimeError('cancelled')
+    with pytest.raises(RuntimeError,match='cancelled'):
+        embedded_xmp.write(path,b'<invalid/>',digest,cancel)
+    assert path.read_bytes()==original
+    assert list(tmp_path.iterdir())==[path]
+
+
+def test_changed_source_not_overwritten(tmp_path):
+    import embedded_xmp
+    path=tmp_path/'photo.jpg';Image.new('RGB',(8,8)).save(path)
+    digest=embedded_xmp.fingerprint(path)
+    Image.new('RGB',(8,8),'red').save(path)
+    newer=path.read_bytes()
+    with pytest.raises(RuntimeError,match='изменилась'):
+        embedded_xmp.write(path,b'<invalid/>',digest)
+    assert path.read_bytes()==newer
+    assert list(tmp_path.iterdir())==[path]

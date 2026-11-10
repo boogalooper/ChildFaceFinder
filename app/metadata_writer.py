@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import embedded_xmp
+from stage_progress import track
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -39,6 +40,7 @@ class XmpExportSummary:
     unchanged_files: int = 0
     failed_files: int = 0
     failed_photos: set[Path] = field(default_factory=set)
+    errors: dict[Path, str] = field(default_factory=dict)
 
 
 class XmpMetadataWriter:
@@ -283,13 +285,14 @@ class XmpMetadataWriter:
         sync_labels: bool = False,
         best_label: str = 'Select',
         legacy_best: bool = True,
+        progress=lambda done, total, name: None,
     ) -> XmpExportSummary:
         best_photos = best_photos or set()
         candidates = set(people_by_photo) | set(all_photos or ()) | set(best_photos)
         groups = {}
         embedded = set()
         summary = XmpExportSummary()
-        for image_path in sorted(candidates, key=lambda p: (str(p).casefold(), str(p))):
+        for image_path in track(sorted(candidates, key=lambda p: (str(p).casefold(), str(p))), progress, "Подготовка XMP", lambda p: p.name):
             if check_cancel:
                 check_cancel()
             try:
@@ -309,8 +312,9 @@ class XmpMetadataWriter:
                 summary.requested_files += 1
                 summary.failed_files += 1
                 summary.failed_photos.add(image_path)
+                summary.errors[image_path] = str(exc)
                 self.log(f"XMP: {image_path}: {exc}")
-        for siblings in groups.values():
+        for siblings in track(list(groups.values()), progress, "Запись XMP", lambda group: group[0][0].name):
             if check_cancel:
                 check_cancel()
             image_path, xmp_path = siblings[0]
@@ -323,6 +327,7 @@ class XmpMetadataWriter:
             if len(siblings) > 1:
                 summary.failed_files += 1
                 summary.failed_photos.update(p for p, _ in siblings)
+                summary.errors.update({p: "Несколько изображений используют один sidecar" for p, _ in siblings})
                 self.log("XMP пропущен: несколько изображений используют один sidecar: " + ", ".join(str(p) for p, _ in siblings))
                 continue
             people = people_by_photo.get(image_path, set())
@@ -368,6 +373,7 @@ class XmpMetadataWriter:
                     check_cancel()
                 summary.failed_files += 1
                 summary.failed_photos.add(image_path)
+                summary.errors[image_path] = str(exc)
                 self.log(f"XMP: не удалось записать {xmp_path}: {exc}")
 
         return summary
