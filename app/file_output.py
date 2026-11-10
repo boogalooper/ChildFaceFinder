@@ -14,6 +14,9 @@ from runtime_safety import atomic_path
 @dataclass
 class FileOutputSummary:
     copies: int = 0
+    completed_photos: int = 0
+    metadata_blocked: int = 0
+    transfer_errors: int = 0
     moved: int = 0
     failed: int = 0
     skipped: int = 0
@@ -109,6 +112,7 @@ def export_people(people_by_photo, source_root, destination, *, move=False,
             if sidecar.is_symlink():
                 raise ValueError('XMP является ссылкой; перенос пропущен')
             if move and image in (blocked or set()):
+                summary.metadata_blocked += 1
                 reason = blocked.get(image, '') if isinstance(blocked, dict) else ''
                 raise ValueError('XMP не был успешно обновлён: исходник не перемещён' + (f'. Причина: {reason}' if reason else ''))
             if move and has_xmp and len(siblings.get((str(image.parent.resolve()).casefold(), image.stem.casefold()), ())) > 1:
@@ -160,6 +164,7 @@ def export_people(people_by_photo, source_root, destination, *, move=False,
                 item['status'] = 'moved'
             else:
                 item['status'] = 'copied'
+            summary.completed_photos += 1
         except Exception as exc:
             # Cancellation callbacks raise; re-check outside error accounting.
             try:
@@ -171,6 +176,8 @@ def export_people(people_by_photo, source_root, destination, *, move=False,
             item['status'] = 'error'
             item['error'] = str(exc)
             summary.failed += 1
+            if not (move and image in (blocked or set())):
+                summary.transfer_errors += 1
             log(f'Файлы: {image.name}: {exc}')
         except BaseException:
             item['status'] = 'cancelled'

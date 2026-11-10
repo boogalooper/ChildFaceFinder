@@ -9,6 +9,19 @@ import tempfile
 _UNCHECKED = object()
 
 
+def check_output_directory(folder):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix='.cff-write-check-', dir=folder)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(b'ChildFaceFinder output check')
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        Path(name).unlink()
+
+
 def file_snapshot(path):
     try:
         return Path(path).read_bytes()
@@ -116,7 +129,10 @@ def guarded_run(function):
         with ExitStack() as stack:
             stack.enter_context(exclusive_lock(photos_dir / '.ChildFaceFinder.lock'))
             if workflow is not None and workflow.output == 'folders':
+                check_output_directory(workflow.destination)
                 stack.enter_context(exclusive_lock(Path(workflow.destination) / '.ChildFaceFinder.lock'))
+            for folder in {p.parent for p in outputs}:
+                check_output_directory(folder)
             for path in sorted(outputs, key=str):
                 stack.enter_context(exclusive_lock(path.with_name('.' + path.name + '.cff.lock')))
             return function(self, references_dir, photos_dir, output_csv)

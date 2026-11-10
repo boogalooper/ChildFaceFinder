@@ -3,6 +3,8 @@ from __future__ import annotations
 from workflow import WorkflowOptions
 
 import os
+import uuid
+from datetime import datetime
 import queue
 import threading
 import traceback
@@ -152,6 +154,7 @@ class App(tk.Tk):
         self.geometry("1000x850")
         self.minsize(900, 720)
 
+        self.log_lock = threading.Lock()
         self.events: queue.Queue[tuple] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.finder: ChildFaceFinder | None = None
@@ -159,6 +162,9 @@ class App(tk.Tk):
         self.closing_after_cancel = False
 
         saved = load_user_settings()
+        from theme_manager import MODES
+        theme = saved.get('theme_mode', MODES[0])
+        self.theme_var = tk.StringVar(value=theme if theme in MODES else MODES[0])
         self.ref_var = tk.StringVar(value=str(saved.get("reference_folder", "")))
         self.photos_var = tk.StringVar(value=str(saved.get("photo_folder", "")))
         self.output_var = tk.StringVar(value=str(saved.get("output_csv", "")))
@@ -210,6 +216,8 @@ class App(tk.Tk):
         self.collector_indeterminate = False
 
         self._build_ui()
+        from theme_manager import ThemeManager
+        self.theme_manager = ThemeManager(self)
         removed_temp, failed_temp = cleanup_stale_temp_dirs()
         if removed_temp:
             self._append_log(f"TEMP: удалено оставшихся каталогов предыдущих запусков: {len(removed_temp)}")
@@ -219,114 +227,8 @@ class App(tk.Tk):
         self.after(100, self._poll_events)
 
     def _build_ui(self) -> None:
-        self.title('Child Face Finder — поиск людей на фотографиях')
-        self.geometry('920x790')
-        self.minsize(840, 720)
-        self._main_controls = []
-        outer = ttk.Frame(self, padding=14)
-        outer.pack(fill='both', expand=True)
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(7, weight=1)
-        top = ttk.Frame(outer)
-        top.grid(row=0, column=0, sticky='ew', pady=(0, 8))
-        ttk.Label(top, text='Люди на фотографиях', font=('Segoe UI', 15, 'bold')).pack(side='left')
-        self.settings_btn = ttk.Button(top, text='Настройки…', command=self._open_settings)
-        self.settings_btn.pack(side='right')
-        self._main_controls.append(self.settings_btn)
-
-        scenario = ttk.LabelFrame(outer, text='1. Что найти', padding=8)
-        scenario.grid(row=1, column=0, sticky='ew', pady=4)
-        for label, value in [('Людей по эталонным фото', 'references'), ('Уникальные лица в съёмке', 'discover')]:
-            button = ttk.Radiobutton(scenario, text=label, variable=self.scenario_var, value=value,
-                                    command=self._scenario_changed)
-            button.pack(side='left', padx=(0, 24))
-            self._main_controls.append(button)
-
-        inputs = ttk.LabelFrame(outer, text='2. Исходные фотографии', padding=8)
-        inputs.grid(row=2, column=0, sticky='ew', pady=4)
-        inputs.columnconfigure(0, weight=1)
-        def path_row(parent, label, variable, command):
-            row = ttk.Frame(parent)
-            row.columnconfigure(1, weight=1)
-            ttk.Label(row, text=label, width=17).grid(row=0, column=0, sticky='w')
-            entry = ttk.Entry(row, textvariable=variable)
-            entry.grid(row=0, column=1, sticky='ew', padx=6)
-            button = ttk.Button(row, text='Обзор…', command=command, width=10)
-            button.grid(row=0, column=2)
-            self._main_controls.extend((entry, button))
-            return row
-        self.ref_row = path_row(inputs, 'Эталонные фото', self.ref_var, self._browse_refs)
-        self.ref_row.grid(row=0, column=0, sticky='ew', pady=3)
-        path_row(inputs, 'Фото съёмки', self.photos_var, self._browse_photos).grid(row=1, column=0, sticky='ew', pady=3)
-        recursive = ttk.Checkbutton(inputs, text='Включая подпапки съёмки', variable=self.recursive_var)
-        recursive.grid(row=2, column=0, sticky='w', pady=(4, 0))
-        self._main_controls.append(recursive)
-        self.scenario_hint = ttk.Label(inputs, wraplength=840, foreground='#555555')
-        self.scenario_hint.grid(row=3, column=0, sticky='w', pady=(4, 0))
-
-        output = ttk.LabelFrame(outer, text='3. Как сохранить результат', padding=8)
-        output.grid(row=3, column=0, sticky='ew', pady=4)
-        output.columnconfigure(0, weight=1)
-        choices = ttk.Frame(output)
-        choices.grid(row=0, column=0, sticky='w', pady=(0, 5))
-        for label, value in [('Список CSV', 'csv'), ('По папкам людей', 'folders'), ('Только анализ и метки', 'analysis')]:
-            button = ttk.Radiobutton(choices, text=label, variable=self.output_mode_var, value=value)
-            button.pack(side='left', padx=(0, 24))
-            self._main_controls.append(button)
-        self.csv_row = path_row(output, 'Файл CSV', self.output_var, self._browse_output)
-        self.csv_row.grid(row=1, column=0, sticky='ew')
-        self.folder_rows = ttk.Frame(output)
-        self.folder_rows.columnconfigure(0, weight=1)
-        self.folder_rows.grid(row=2, column=0, sticky='ew')
-        path_row(self.folder_rows, 'Папка результата', self.destination_var, self._browse_destination).grid(row=0, column=0, sticky='ew')
-        transfer = ttk.Frame(self.folder_rows)
-        transfer.grid(row=1, column=0, sticky='w', pady=(6, 0))
-        for label, value in [('Копировать', 'copy'), ('Переместить', 'move')]:
-            button = ttk.Radiobutton(transfer, text=label, variable=self.transfer_var, value=value)
-            button.pack(side='left', padx=(0, 20))
-            self._main_controls.append(button)
-        self.transfer_hint = ttk.Label(self.folder_rows, wraplength=830, foreground='#555555')
-        self.transfer_hint.grid(row=2, column=0, sticky='w', pady=(4, 0))
-
-        metadata = ttk.LabelFrame(outer, text='4. Метаданные — необязательно', padding=8)
-        metadata.grid(row=4, column=0, sticky='ew', pady=4)
-        master = ttk.Checkbutton(metadata, text='Записывать метаданные XMP', variable=self.xmp_enabled_var)
-        master.grid(row=0, column=0, sticky='w')
-        self._main_controls.append(master)
-        self.people_check = ttk.Checkbutton(metadata, text='Перезаписать список найденных людей', variable=self.write_xmp_var)
-        self.people_check.grid(row=1, column=0, sticky='w', padx=20, pady=2)
-        self.best_check = ttk.Checkbutton(metadata, text='Определить серии и отметить лучшие кадры цветом', variable=self.best_series_var)
-        self.best_check.grid(row=2, column=0, sticky='w', padx=20, pady=2)
-        self._main_controls.extend((self.people_check, self.best_check))
-        self.metadata_hint = ttk.Label(metadata, wraplength=840, foreground='#555555')
-        self.metadata_hint.grid(row=3, column=0, sticky='w', pady=(4, 0))
-
-        actions = ttk.Frame(outer)
-        actions.grid(row=5, column=0, sticky='ew', pady=(8, 3))
-        self.start_btn = ttk.Button(actions, text='Начать обработку', command=self._start)
-        self.start_btn.pack(side='left')
-        self.cancel_btn = ttk.Button(actions, text='Отмена', command=self._cancel, state='disabled')
-        self.cancel_btn.pack(side='left', padx=8)
-        self.collect_btn = ttk.Button(self, command=self._collect_files)  # legacy entry point, not a main-screen action
-        self.launch_hint = ttk.Label(actions, wraplength=590, foreground='#555555')
-        self.launch_hint.pack(side='left', padx=8)
-        self.progress = ttk.Progressbar(outer, variable=self.progress_var, maximum=100)
-        self.progress.grid(row=6, column=0, sticky='ew', pady=(3, 5))
-        log = ttk.LabelFrame(outer, text='Ход обработки', padding=5)
-        log.grid(row=7, column=0, sticky='nsew')
-        log.rowconfigure(0, weight=1)
-        log.columnconfigure(0, weight=1)
-        self.log_text = tk.Text(log, height=6, wrap='word', state='disabled')
-        self.log_text.grid(row=0, column=0, sticky='nsew')
-        scrollbar = ttk.Scrollbar(log, command=self.log_text.yview)
-        scrollbar.grid(row=0, column=1, sticky='ns')
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-        ttk.Label(outer, textvariable=self.status_var).grid(row=8, column=0, sticky='w', pady=(5, 0))
-        for variable in (self.scenario_var, self.output_mode_var, self.transfer_var, self.xmp_enabled_var,
-                         self.write_xmp_var, self.best_series_var, self.ref_var, self.photos_var,
-                         self.output_var, self.destination_var, self.best_label_var, self.filter_quality_var):
-            variable.trace_add('write', lambda *_: self._refresh_workflow())
-        self._refresh_workflow()
+        from modern_ui import build
+        build(self)
 
     def _scenario_changed(self):
         self.filter_quality_var.set(self.scenario_var.get() == 'references')
@@ -345,22 +247,22 @@ class App(tk.Tk):
             return
         reference = self.scenario_var.get() == 'references'
         self.ref_row.grid() if reference else self.ref_row.grid_remove()
-        self.scenario_hint.configure(text='Имена людей берутся из имён эталонных файлов. Эталоны ищутся во всех подпапках.' if reference
+        self.scenario_hint.configure(text='Имена берутся из названий эталонных файлов.' if reference
             else 'Эталоны не нужны. Найденные люди получат обозначения Лицо_0001, Лицо_0002…')
         mode = self.output_mode_var.get()
         self.csv_row.grid() if mode == 'csv' else self.csv_row.grid_remove()
         self.folder_rows.grid() if mode == 'folders' else self.folder_rows.grid_remove()
         moving = self.transfer_var.get() == 'move'
-        self.transfer_hint.configure(text=('Фото и XMP удаляются из съёмки только после проверки всех копий. ' if moving else 'Исходники остаются на месте; XMP копируются вместе с фото. ')
-            + 'Групповой кадр попадёт в папку каждого найденного человека.')
+        self.transfer_hint.configure(text=('Оригиналы удаляются после проверки копий. ' if moving else 'Исходники остаются на месте; XMP копируются вместе с фото. ')
+            + 'Групповой кадр — в папку каждого человека.')
         enabled = self.xmp_enabled_var.get()
         active = enabled and (self.write_xmp_var.get() or self.best_series_var.get())
         if enabled and self.best_series_var.get():
             note = f'Метка лучшего кадра: «{self.best_label_var.get()}» (меняется в настройках). Прежние цветовые метки будут заменены.'
         elif enabled:
-            note = 'Список людей заменяется. Другие ключевые слова, цветовые метки, рейтинг и настройки Camera Raw сохраняются.'
+            note = 'Обновляются только имена людей. Остальные метаданные сохраняются.'
         else:
-            note = 'Существующие XMP не изменяются. При раскладке по папкам они переносятся вместе с фото.'
+            note = 'XMP не изменяются; при раскладке переносятся вместе с фото.'
         self.metadata_hint.configure(text=note)
         problem = ''
         if not self.photos_var.get().strip():
@@ -383,7 +285,16 @@ class App(tk.Tk):
         self.people_check.state(['!disabled'] if enabled and not busy else ['disabled'])
         self.best_check.state(['!disabled'] if enabled and not busy else ['disabled'])
         self.start_btn.state(['disabled'] if problem or busy else ['!disabled'])
-        self.launch_hint.configure(text=problem or ('Перемещение: проверьте выбранную папку результата.' if mode == 'folders' and moving else ('Готово. Неудачные кадры исключаются из результата.' if self.filter_quality_var.get() else 'Готово. В результат попадут все уверенно распознанные кадры.')))
+        action = ('Перемещение' if moving else 'Копирование') if mode == 'folders' else ('CSV' if mode == 'csv' else 'Только метаданные')
+        metadata_actions = []
+        if enabled and self.write_xmp_var.get(): metadata_actions.append('имена')
+        if enabled and self.best_series_var.get(): metadata_actions.append('цветовые метки')
+        plan = ('По эталонам' if reference else 'Уникальные лица') + ' → ' + action + ' → ' + ('XMP: ' + ', '.join(metadata_actions) if metadata_actions else 'без изменения XMP')
+        self.launch_hint.configure(text=problem or plan)
+        self.summary_vars['scenario'].set('По эталонам' if reference else 'Уникальные лица')
+        self.summary_vars['output'].set(action)
+        self.summary_vars['metadata'].set(', '.join(metadata_actions) if metadata_actions else 'Не изменять')
+        self.summary_vars['quality'].set('Включён' if self.filter_quality_var.get() else 'Выключен')
 
     def _browse_destination(self):
         value = filedialog.askdirectory(title='Папка результата — отдельно от исходников')
@@ -401,7 +312,7 @@ class App(tk.Tk):
         dialog = tk.Toplevel(self)
         dialog.withdraw()
         dialog.title('Настройки обработки')
-        dialog.geometry('760x510')
+        dialog.geometry('780x590')
         dialog.resizable(False, False)
         dialog.transient(self)
         tabs = ttk.Notebook(dialog)
@@ -481,9 +392,10 @@ class App(tk.Tk):
         dialog.protocol('WM_DELETE_WINDOW', lambda: close(False))
         dialog.bind('<Escape>', lambda event: close(False))
         self.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - 760) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - 510) // 2
-        dialog.geometry(f'760x510+{x}+{y}')
+        x = self.winfo_rootx() + (self.winfo_width() - 780) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 590) // 2
+        dialog.geometry(f'780x590+{x}+{y}')
+        self.theme_manager.apply()
         dialog.deiconify()
         dialog.grab_set()
 
@@ -591,15 +503,18 @@ class App(tk.Tk):
         self.worker.start()
 
     def _append_log(self, text: str) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", text.rstrip() + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        path = getattr(self, 'run_log_path', None)
+        if path is None:
+            return
+        try:
+            with self.log_lock, path.open('a', encoding='utf-8') as stream:
+                stream.write(f'{datetime.now().isoformat(timespec="seconds")} {text.rstrip()}\n')
+        except OSError as exc:
+            self.events.put(('log_error', str(exc)))
 
     def _clear_log(self) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
+        # Every run gets a new log; previous log files are retained.
+        pass
 
     def _reset_recommended(self) -> None:
         self.search_mode_var.set("Улучшенный")
@@ -653,6 +568,7 @@ class App(tk.Tk):
             "require_gpu": self.require_gpu_var.get(),
             "verbose": self.verbose_var.get(),
             "select_best_series": self.best_series_var.get(),
+            "theme_mode": self.theme_var.get(),
             "write_xmp_tags": self.write_xmp_var.get(),
             "xmp_mark_best": self.xmp_mark_best_var.get(),
         }
@@ -752,10 +668,16 @@ class App(tk.Tk):
             return
 
         self._save_settings()
+        try:
+            from user_settings import default_settings_path
+            folder = default_settings_path().parent / 'logs'
+            folder.mkdir(parents=True, exist_ok=True)
+            self.run_log_path = folder / (datetime.now().strftime('%Y%m%d_%H%M%S_') + uuid.uuid4().hex[:8] + '.log')
+            self.run_log_path.write_text(f'ChildFaceFinder — {datetime.now().isoformat()}\nСъёмка: {photos}\nЭталоны: {refs}\nПараметры: {settings!r}\n', encoding='utf-8')
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f'Не удалось создать журнал: {exc}', parent=self)
+            return
 
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
         self.progress_var.set(0)
         self.status_var.set("Инициализация…")
         self.start_btn.configure(state="disabled")
@@ -763,7 +685,7 @@ class App(tk.Tk):
         self.cancel_btn.configure(state="normal")
 
         def log(text: str) -> None:
-            self.events.put(("log", text))
+            self._append_log(text)
 
         def progress(done: int, total: int, name: str) -> None:
             self.events.put(("progress", done, total, name))
@@ -773,10 +695,13 @@ class App(tk.Tk):
         def task() -> None:
             try:
                 summary = self.finder.run(refs, photos, output)
+                log(f"Итог: {summary!r}")
                 self.events.put(("done", summary))
             except CancelledError as exc:
+                log(str(exc))
                 self.events.put(("cancelled", str(exc)))
             except Exception as exc:
+                log(traceback.format_exc())
                 self.events.put(("error", str(exc), traceback.format_exc()))
 
         self.worker = threading.Thread(target=task, name="cff-main", daemon=True)
@@ -813,7 +738,9 @@ class App(tk.Tk):
             for _ in range(200):
                 event = self.events.get_nowait()
                 kind = event[0]
-                if kind == "log":
+                if kind == "log_error":
+                    self.status_var.set("Не удалось сохранить журнал: " + event[1])
+                elif kind == "log":
                     self._append_log(event[1])
                 elif kind == "progress":
                     _, done, total, name = event
@@ -830,15 +757,18 @@ class App(tk.Tk):
                 elif kind == "done":
                     summary = event[1]
                     self.progress_var.set(100)
-                    self.status_var.set('Готово')
-                    lines = [f'Найдено людей: {summary.found_people}',
+                    from result_status import result_title
+                    title = result_title(summary)
+                    self.status_var.set(title)
+                    lines = [title, f'Фотографий в съёмке: {summary.photo_count}', f'Найдено людей: {summary.found_people}',
                              f'Лиц определено: {summary.identified_faces}; не определено: {summary.unidentified_faces}',
                              f'Фотографий для проверки: {summary.review_photos}']
                     if summary.output_csv is not None:
                         lines += ['', f'Список CSV: {summary.output_csv}']
                     if summary.destination is not None:
                         lines += ['', f'Папка результата: {summary.destination}',
-                                  f'Копий: {summary.file_copies}; исходников перемещено: {summary.file_moves}; ошибок: {summary.file_errors}',
+                                  f'Полностью обработано исходников: {summary.completed_photos}; создано копий: {summary.file_copies}',
+                                  f'Исходников перемещено: {summary.file_moves}',
                                   f'Журнал операций: {summary.transfer_journal}']
                     if summary.best_series_count:
                         lines.append(f'Лучших кадров для людей/серий: {summary.best_series_count}')
@@ -846,12 +776,17 @@ class App(tk.Tk):
                         lines.append(f'XMP: обновлено {summary.xmp_written}; без изменений {summary.xmp_unchanged}; ошибок {summary.xmp_failed}')
                     if summary.review_csv is not None:
                         lines.append(f'Отчёт проверки: {summary.review_csv}')
+                    lines += ['', f'Без уверенных совпадений: {summary.no_match_photos}',
+                              f'Полностью исключено отбором качества: {summary.quality_excluded_photos}',
+                              f'Не удалось прочитать/проанализировать: {summary.unreadable_photos}',
+                              f'Перемещение заблокировано ошибкой XMP: {summary.metadata_blocked}',
+                              f'Ошибки копирования/перемещения: {summary.transfer_errors}']
                     result = '\n'.join(lines)
                     self._append_log(result)
                     self._finish_ui()
                     if self.closing_after_cancel:
                         return
-                    messagebox.showinfo('Обработка завершена', result, parent=self)
+                    self._show_result(title, result, summary.destination or (summary.output_csv.parent if summary.output_csv else Path(self.photos_var.get())))
                 elif kind == "collector_progress":
                     _, done, total, name = event
                     if total > 0:
@@ -941,6 +876,7 @@ class App(tk.Tk):
                     self._finish_ui()
                     if self.closing_after_cancel:
                         return
+                    self._show_result("Обработка отменена", event[1] + "\nУже сохранённые результаты остаются на месте.")
                 elif kind == "error":
                     _, text, details = event
                     self.status_var.set("Ошибка")
@@ -949,11 +885,46 @@ class App(tk.Tk):
                     if self.closing_after_cancel:
                         return
                     if not self.closing_after_cancel:
-                        messagebox.showerror(APP_TITLE, text, parent=self)
+                        self._show_result("Обработка прервана", text)
         except queue.Empty:
             pass
         if self.winfo_exists():
             self.after(100, self._poll_events)
+
+    def _show_result(self, title, text, destination=None):
+        dialog = tk.Toplevel(self)
+        dialog.withdraw()
+        dialog.title(title)
+        dialog.transient(self)
+        content = ttk.Frame(dialog, padding=12)
+        content.pack(fill='both', expand=True)
+        area = tk.Text(content, width=85, height=22, wrap='word')
+        area.pack(side='left', fill='both', expand=True)
+        scrollbar = ttk.Scrollbar(content, command=area.yview)
+        scrollbar.pack(side='right', fill='y')
+        area.configure(yscrollcommand=scrollbar.set)
+        area.insert('1.0', text)
+        area.configure(state='disabled')
+        buttons = ttk.Frame(dialog, padding=12)
+        buttons.pack(fill='x')
+        def open_path(path):
+            try:
+                os.startfile(str(path))
+            except Exception as exc:
+                messagebox.showerror(APP_TITLE, str(exc), parent=dialog)
+        if destination is not None:
+            ttk.Button(buttons, text='Открыть результат', command=lambda: open_path(destination)).pack(side='left')
+        log_path = getattr(self, 'run_log_path', None)
+        if log_path is not None:
+            ttk.Button(buttons, text='Открыть журнал', command=lambda: open_path(log_path)).pack(side='left', padx=8)
+        ttk.Button(buttons, text='Закрыть', command=dialog.destroy).pack(side='right')
+        dialog.update_idletasks()
+        width, height = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+        dialog.geometry(f'+{self.winfo_rootx() + (self.winfo_width()-width)//2}+{self.winfo_rooty() + (self.winfo_height()-height)//2}')
+        self.theme_manager.apply()
+        dialog.deiconify()
+        dialog.grab_set()
+        dialog.bind('<Escape>', lambda event: dialog.destroy())
 
     def _on_close(self) -> None:
         self._save_settings()

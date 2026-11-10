@@ -157,6 +157,12 @@ class RunSummary:
     found_people: int = 0
     review_photos: int = 0
     file_copies: int = 0
+    completed_photos: int = 0
+    no_match_photos: int = 0
+    quality_excluded_photos: int = 0
+    unreadable_photos: int = 0
+    metadata_blocked: int = 0
+    transfer_errors: int = 0
     file_moves: int = 0
     file_errors: int = 0
     destination: Path | None = None
@@ -1598,6 +1604,12 @@ class ChildFaceFinder:
             xmp_failed=xmp_failed,
             xmp_enabled=xmp_enabled,
             file_copies=transfer_summary.copies if transfer_summary else 0,
+            completed_photos=transfer_summary.completed_photos if transfer_summary else 0,
+            no_match_photos=len({a.path for a in analyses} - set(metadata_people)),
+            quality_excluded_photos=len({relative for _, relative in identity_details} - {row[2] for row in match_rows}),
+            unreadable_photos=len(failed_analyses),
+            metadata_blocked=transfer_summary.metadata_blocked if transfer_summary else 0,
+            transfer_errors=transfer_summary.transfer_errors if transfer_summary else 0,
             file_moves=transfer_summary.moved if transfer_summary else 0,
             file_errors=transfer_summary.failed if transfer_summary else 0,
             destination=workflow.destination if workflow is not None and workflow.output == 'folders' else None,
