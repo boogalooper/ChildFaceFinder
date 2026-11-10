@@ -22,3 +22,6 @@ requests==2.32.3
 Pillow==12.3.0
 pillow-heif==1.5.0
 rawpy==0.27.0
+
+# Embedded XMP writer; no pixel re-encoding.
+pyexiv2==2.16.0

@@ -57,3 +57,35 @@ def test_legacy_csv_without_source_column_uses_unique_stem(tmp_path: Path) -> No
     assert summary.copied == 1
     assert summary.skipped == 0
     assert (destination / "Ребёнок" / "IMG_0042.CR3").is_file()
+
+
+def test_copy_failure_never_deletes_existing_target(tmp_path):
+    import pytest
+    from collector import _copy_file_cancellable
+    source = tmp_path/'missing.jpg'
+    target = tmp_path/'original.jpg'
+    target.write_bytes(b'valuable original')
+    with pytest.raises(FileNotFoundError):
+        _copy_file_cancellable(source, target)
+    assert target.read_bytes() == b'valuable original'
+    source.write_bytes(b'new image')
+    with pytest.raises(FileExistsError):
+        _copy_file_cancellable(source, target)
+    assert target.read_bytes() == b'valuable original'
+
+
+def test_cancel_copy_removes_only_its_partial_file(tmp_path):
+    import pytest
+    from collector import _copy_file_cancellable, CollectorCancelled
+    source = tmp_path/'source.jpg'
+    target = tmp_path/'copy.jpg'
+    source.write_bytes(b'x' * 100)
+    calls = 0
+    def cancel():
+        nonlocal calls
+        calls += 1
+        return calls >= 3
+    with pytest.raises(CollectorCancelled):
+        _copy_file_cancellable(source, target, cancel_check=cancel, chunk_size=10)
+    assert not target.exists()
+    assert source.read_bytes() == b'x' * 100

@@ -27,3 +27,33 @@ def test_heic_decodes_directly_without_temp_jpeg(monkeypatch, tmp_path: Path) ->
 
     assert result is expected
     assert list(tmp_path.iterdir()) == []
+
+
+def test_windows_process_access_denied_is_treated_as_alive(monkeypatch):
+    loader = _import_image_loader(monkeypatch)
+    class Kernel:
+        pass
+    kernel = Kernel()
+    kernel.OpenProcess = lambda *args: 0
+    kernel.GetExitCodeProcess = lambda *args: 0
+    kernel.CloseHandle = lambda *args: 1
+    kernel.GetLastError = lambda: 5
+    assert loader._windows_pid_is_running(1234, kernel)
+    kernel.GetLastError = lambda: 87
+    assert not loader._windows_pid_is_running(1234, kernel)
+
+
+def test_windows_large_process_handle_is_preserved(monkeypatch):
+    import ctypes
+    loader = _import_image_loader(monkeypatch)
+    handle = 0x123456789
+    seen = []
+    def query(value, output):
+        assert value == handle
+        output._obj.value = 259
+        return 1
+    kernel = types.SimpleNamespace(OpenProcess=lambda *args: handle, GetExitCodeProcess=query,
+                                   CloseHandle=lambda value: seen.append(value), GetLastError=lambda: 0)
+    assert loader._windows_pid_is_running(1234, kernel)
+    assert kernel.OpenProcess.restype == ctypes.c_void_p
+    assert seen == [handle]

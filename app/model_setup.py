@@ -10,6 +10,8 @@ import uuid
 import zipfile
 from pathlib import Path
 
+from runtime_safety import exclusive_lock
+
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR.parent
 INSIGHTFACE_ROOT = PROJECT_DIR / "models" / "insightface"
@@ -18,7 +20,8 @@ MODEL_DIR = INSIGHTFACE_ROOT / "models" / MODEL_NAME
 MODEL_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/antelopev2.zip"
 
 
-def model_is_valid(path: Path = MODEL_DIR) -> bool:
+def model_is_valid(path: Path | None = None) -> bool:
+    path = path if path is not None else MODEL_DIR
     if not path.is_dir():
         return False
     onnx_files = list(path.glob("*.onnx"))
@@ -144,6 +147,11 @@ def _recover_interrupted_model_swap() -> None:
 
 
 def ensure_antelopev2(force: bool = False) -> Path:
+    with exclusive_lock(MODEL_DIR.parent / '.antelopev2.install.lock'):
+        return _ensure_antelopev2(force)
+
+
+def _ensure_antelopev2(force: bool = False) -> Path:
     MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
     _recover_interrupted_model_swap()
 

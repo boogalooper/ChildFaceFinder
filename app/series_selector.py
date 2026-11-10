@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Callable
 
 from PIL import Image
 
@@ -121,7 +121,7 @@ def read_photo_order_info(path: Path) -> PhotoOrderInfo:
     if capture_time is None:
         try:
             capture_time = datetime.fromtimestamp(path.stat().st_mtime)
-        except OSError:
+        except (OSError, ValueError, OverflowError):
             capture_time = datetime.min
 
     return PhotoOrderInfo(
@@ -242,6 +242,7 @@ def split_target_series(
     info_cache: dict[Path, PhotoOrderInfo] | None = None,
     targets_by_path: dict[Path, set[str]] | None = None,
     foreign_break_confirm_frames: int = 2,
+    check_cancel: Callable[[], None] | None = None,
 ) -> list[list[BestFrameCandidate]]:
     """Split already-identified frames into chronological shooting runs.
 
@@ -253,12 +254,17 @@ def split_target_series(
         return []
     cache = info_cache if info_cache is not None else {}
     for candidate in candidates:
-        cache.setdefault(candidate.path, read_photo_order_info(candidate.path))
+        if check_cancel:
+            check_cancel()
+        if candidate.path not in cache:
+            cache[candidate.path] = read_photo_order_info(candidate.path)
 
     ordered = _ordered_candidates(candidates, cache)
     groups: list[list[BestFrameCandidate]] = [[ordered[0]]]
 
     for previous, current in zip(ordered, ordered[1:]):
+        if check_cancel:
+            check_cancel()
         prev_info = cache[previous.path]
         cur_info = cache[current.path]
 
@@ -275,7 +281,7 @@ def split_target_series(
         # only filesystem mtime and a camera sequence exists, rely on the camera
         # counter instead because copied files often share arbitrary mtimes.
         time_ok = True
-        delta_seconds = max(0.0, (cur_info.capture_time - prev_info.capture_time).total_seconds())
+        delta_seconds = abs((cur_info.capture_time - prev_info.capture_time).total_seconds())
         if prev_info.time_is_metadata and cur_info.time_is_metadata:
             time_ok = delta_seconds <= max_gap_seconds
         elif prev_info.sequence_number is None or cur_info.sequence_number is None:
@@ -415,6 +421,7 @@ def select_best_series_frames(
     eye_open_threshold: float,
     max_gap_seconds: float = 12.0,
     max_filename_gap: int = 5,
+    check_cancel: Callable[[], None] | None = None,
 ) -> list[BestSeriesSelection]:
     by_person: dict[str, list[BestFrameCandidate]] = {}
     all_candidates = list(candidates)
@@ -424,11 +431,16 @@ def select_best_series_frames(
     info_cache: dict[Path, PhotoOrderInfo] = {}
     targets_by_path: dict[Path, set[str]] = {}
     for candidate in all_candidates:
-        info_cache.setdefault(candidate.path, read_photo_order_info(candidate.path))
+        if check_cancel:
+            check_cancel()
+        if candidate.path not in info_cache:
+            info_cache[candidate.path] = read_photo_order_info(candidate.path)
         targets_by_path.setdefault(candidate.path, set()).add(candidate.person_id)
 
     selections: list[BestSeriesSelection] = []
     for person_id in sorted(by_person, key=str.casefold):
+        if check_cancel:
+            check_cancel()
         groups = split_target_series(
             by_person[person_id],
             max_gap_seconds=max_gap_seconds,
@@ -436,6 +448,7 @@ def select_best_series_frames(
             info_cache=info_cache,
             targets_by_path=targets_by_path,
             foreign_break_confirm_frames=2,
+            check_cancel=check_cancel,
         )
         for series_index, group in enumerate(groups, start=1):
             candidate, score, eye, sharp_rank, pose = select_best_from_series(

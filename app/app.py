@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from workflow import WorkflowOptions
+
 import os
 import queue
 import threading
@@ -9,11 +11,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from collector import CollectorSummary, collect_from_csv
-from engine import CancelledError, ChildFaceFinder, RunSummary, Settings
+from engine import CancelledError, ChildFaceFinder, Settings
 from image_loader import cleanup_stale_temp_dirs
 from user_settings import load_user_settings, save_user_settings
 
-APP_TITLE = "Child Face Finder — поиск людей по эталонам"
+APP_TITLE = "Child Face Finder — поиск людей на фотографиях"
 
 QUALITY_PRESETS = {
     "Мягкий": dict(
@@ -73,7 +75,7 @@ SEARCH_MODES = {
 def _saved_int(values: dict, key: str, default: int, low: int, high: int) -> int:
     try:
         value = int(values.get(key, default))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         value = default
     return max(low, min(high, value))
 
@@ -188,6 +190,21 @@ class App(tk.Tk):
         if self.quality_preset_var.get() not in QUALITY_PRESETS:
             self.quality_preset_var.set("Нормальный")
 
+        self.scenario_var = tk.StringVar(value=saved.get('scenario', 'references'))
+        self.output_mode_var = tk.StringVar(value=saved.get('output_mode', 'csv'))
+        self.destination_var = tk.StringVar(value=saved.get('destination', ''))
+        self.transfer_var = tk.StringVar(value=saved.get('transfer', 'copy'))
+        self.xmp_enabled_var = tk.BooleanVar(value=bool(saved.get('xmp_enabled', saved.get('write_xmp_tags', False))))
+        self.write_xmp_var.set(bool(saved.get('write_people', True)))
+        self.best_label_var = tk.StringVar(value=saved.get('best_label', 'Select'))
+        self.filter_quality_var = tk.BooleanVar(value=bool(saved.get('filter_quality', self.scenario_var.get() == 'references')))
+        self.detailed_csv_var = tk.BooleanVar(value=bool(saved.get('detailed_csv', False)))
+        for variable, allowed, default in ((self.scenario_var, ('references', 'discover'), 'references'),
+                (self.output_mode_var, ('csv', 'folders', 'analysis'), 'csv'),
+                (self.transfer_var, ('copy', 'move'), 'copy')):
+            if variable.get() not in allowed:
+                variable.set(default)
+        self._starting = False
         self.status_var = tk.StringVar(value="Готово к запуску")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.collector_indeterminate = False
@@ -202,256 +219,273 @@ class App(tk.Tk):
         self.after(100, self._poll_events)
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self, padding=12)
-        outer.pack(fill="both", expand=True)
-        outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(9, weight=1)
+        self.title('Child Face Finder — поиск людей на фотографиях')
+        self.geometry('920x790')
+        self.minsize(840, 720)
+        self._main_controls = []
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill='both', expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(7, weight=1)
+        top = ttk.Frame(outer)
+        top.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+        ttk.Label(top, text='Люди на фотографиях', font=('Segoe UI', 15, 'bold')).pack(side='left')
+        self.settings_btn = ttk.Button(top, text='Настройки…', command=self._open_settings)
+        self.settings_btn.pack(side='right')
+        self._main_controls.append(self.settings_btn)
 
-        ttk.Label(outer, text="Эталонные изображения целей (дети/взрослые):").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(outer, textvariable=self.ref_var).grid(row=0, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Button(outer, text="Обзор…", command=self._browse_refs).grid(row=0, column=2, pady=4)
+        scenario = ttk.LabelFrame(outer, text='1. Что найти', padding=8)
+        scenario.grid(row=1, column=0, sticky='ew', pady=4)
+        for label, value in [('Людей по эталонным фото', 'references'), ('Уникальные лица в съёмке', 'discover')]:
+            button = ttk.Radiobutton(scenario, text=label, variable=self.scenario_var, value=value,
+                                    command=self._scenario_changed)
+            button.pack(side='left', padx=(0, 24))
+            self._main_controls.append(button)
 
-        ttk.Label(outer, text="Папка фотографий:").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(outer, textvariable=self.photos_var).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Button(outer, text="Обзор…", command=self._browse_photos).grid(row=1, column=2, pady=4)
+        inputs = ttk.LabelFrame(outer, text='2. Исходные фотографии', padding=8)
+        inputs.grid(row=2, column=0, sticky='ew', pady=4)
+        inputs.columnconfigure(0, weight=1)
+        def path_row(parent, label, variable, command):
+            row = ttk.Frame(parent)
+            row.columnconfigure(1, weight=1)
+            ttk.Label(row, text=label, width=17).grid(row=0, column=0, sticky='w')
+            entry = ttk.Entry(row, textvariable=variable)
+            entry.grid(row=0, column=1, sticky='ew', padx=6)
+            button = ttk.Button(row, text='Обзор…', command=command, width=10)
+            button.grid(row=0, column=2)
+            self._main_controls.extend((entry, button))
+            return row
+        self.ref_row = path_row(inputs, 'Эталонные фото', self.ref_var, self._browse_refs)
+        self.ref_row.grid(row=0, column=0, sticky='ew', pady=3)
+        path_row(inputs, 'Фото съёмки', self.photos_var, self._browse_photos).grid(row=1, column=0, sticky='ew', pady=3)
+        recursive = ttk.Checkbutton(inputs, text='Включая подпапки съёмки', variable=self.recursive_var)
+        recursive.grid(row=2, column=0, sticky='w', pady=(4, 0))
+        self._main_controls.append(recursive)
+        self.scenario_hint = ttk.Label(inputs, wraplength=840, foreground='#555555')
+        self.scenario_hint.grid(row=3, column=0, sticky='w', pady=(4, 0))
 
-        ttk.Label(outer, text="CSV результата:").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Entry(outer, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Button(outer, text="Обзор…", command=self._browse_output).grid(row=2, column=2, pady=4)
+        output = ttk.LabelFrame(outer, text='3. Как сохранить результат', padding=8)
+        output.grid(row=3, column=0, sticky='ew', pady=4)
+        output.columnconfigure(0, weight=1)
+        choices = ttk.Frame(output)
+        choices.grid(row=0, column=0, sticky='w', pady=(0, 5))
+        for label, value in [('Список CSV', 'csv'), ('По папкам людей', 'folders'), ('Только анализ и метки', 'analysis')]:
+            button = ttk.Radiobutton(choices, text=label, variable=self.output_mode_var, value=value)
+            button.pack(side='left', padx=(0, 24))
+            self._main_controls.append(button)
+        self.csv_row = path_row(output, 'Файл CSV', self.output_var, self._browse_output)
+        self.csv_row.grid(row=1, column=0, sticky='ew')
+        self.folder_rows = ttk.Frame(output)
+        self.folder_rows.columnconfigure(0, weight=1)
+        self.folder_rows.grid(row=2, column=0, sticky='ew')
+        path_row(self.folder_rows, 'Папка результата', self.destination_var, self._browse_destination).grid(row=0, column=0, sticky='ew')
+        transfer = ttk.Frame(self.folder_rows)
+        transfer.grid(row=1, column=0, sticky='w', pady=(6, 0))
+        for label, value in [('Копировать', 'copy'), ('Переместить', 'move')]:
+            button = ttk.Radiobutton(transfer, text=label, variable=self.transfer_var, value=value)
+            button.pack(side='left', padx=(0, 20))
+            self._main_controls.append(button)
+        self.transfer_hint = ttk.Label(self.folder_rows, wraplength=830, foreground='#555555')
+        self.transfer_hint.grid(row=2, column=0, sticky='w', pady=(4, 0))
 
-        ref_note = (
-            "Эталоны ищутся во всех подпапках. ID берётся только из имени файла: "
-            "«портрет\\Котов Никита.jpg», «стоя\\Котов Никита.jpg» и другие файлы с тем же именем — эталоны «Котов Никита». "
-            "Также поддерживаются ведущие номера («712 Котов Никита.jpg»), буквенные индексы («A Котов Никита.jpg») "
-            "и одинарные имена («Котов.jpg»). Латиница в именах сохраняется."
-        )
-        ref_label = ttk.Label(outer, text=ref_note, wraplength=950)
-        ref_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(1, 8))
-        add_tooltip(
-            ref_label,
-            "Подкаталог (например «портрет» или «стоя») не входит в ID. Сначала объединяются одинаковые нормализованные имена. "
-            "Если имена отличаются, несколько эталонов могут быть объединены по однозначной общей части, например «Котов» + «Котов Никита» или "
-            "«Котов Никита портрет» + «Котов Никита стоя» + «Котов Никита улица». При неоднозначности программа не угадывает, а сообщает ошибку. "
-            "Регистр, лишние пробелы и Е/Ё не мешают. Латиница поддерживается и сохраняется; удаляется только отдельный ведущий "
-            "индекс A–Z. Количество эталонов не ограничено; их embeddings не усредняются.",
-        )
+        metadata = ttk.LabelFrame(outer, text='4. Метаданные — необязательно', padding=8)
+        metadata.grid(row=4, column=0, sticky='ew', pady=4)
+        master = ttk.Checkbutton(metadata, text='Записывать метаданные XMP', variable=self.xmp_enabled_var)
+        master.grid(row=0, column=0, sticky='w')
+        self._main_controls.append(master)
+        self.people_check = ttk.Checkbutton(metadata, text='Перезаписать список найденных людей', variable=self.write_xmp_var)
+        self.people_check.grid(row=1, column=0, sticky='w', padx=20, pady=2)
+        self.best_check = ttk.Checkbutton(metadata, text='Определить серии и отметить лучшие кадры цветом', variable=self.best_series_var)
+        self.best_check.grid(row=2, column=0, sticky='w', padx=20, pady=2)
+        self._main_controls.extend((self.people_check, self.best_check))
+        self.metadata_hint = ttk.Label(metadata, wraplength=840, foreground='#555555')
+        self.metadata_hint.grid(row=3, column=0, sticky='w', pady=(4, 0))
 
-        recognition = ttk.LabelFrame(outer, text="Поиск и распознавание лиц", padding=10)
-        recognition.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(3, 6))
-        for col in range(8):
-            recognition.columnconfigure(col, weight=1 if col in (1, 4, 7) else 0)
+        actions = ttk.Frame(outer)
+        actions.grid(row=5, column=0, sticky='ew', pady=(8, 3))
+        self.start_btn = ttk.Button(actions, text='Начать обработку', command=self._start)
+        self.start_btn.pack(side='left')
+        self.cancel_btn = ttk.Button(actions, text='Отмена', command=self._cancel, state='disabled')
+        self.cancel_btn.pack(side='left', padx=8)
+        self.collect_btn = ttk.Button(self, command=self._collect_files)  # legacy entry point, not a main-screen action
+        self.launch_hint = ttk.Label(actions, wraplength=590, foreground='#555555')
+        self.launch_hint.pack(side='left', padx=8)
+        self.progress = ttk.Progressbar(outer, variable=self.progress_var, maximum=100)
+        self.progress.grid(row=6, column=0, sticky='ew', pady=(3, 5))
+        log = ttk.LabelFrame(outer, text='Ход обработки', padding=5)
+        log.grid(row=7, column=0, sticky='nsew')
+        log.rowconfigure(0, weight=1)
+        log.columnconfigure(0, weight=1)
+        self.log_text = tk.Text(log, height=6, wrap='word', state='disabled')
+        self.log_text.grid(row=0, column=0, sticky='nsew')
+        scrollbar = ttk.Scrollbar(log, command=self.log_text.yview)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        ttk.Label(outer, textvariable=self.status_var).grid(row=8, column=0, sticky='w', pady=(5, 0))
+        for variable in (self.scenario_var, self.output_mode_var, self.transfer_var, self.xmp_enabled_var,
+                         self.write_xmp_var, self.best_series_var, self.ref_var, self.photos_var,
+                         self.output_var, self.destination_var, self.best_label_var, self.filter_quality_var):
+            variable.trace_add('write', lambda *_: self._refresh_workflow())
+        self._refresh_workflow()
 
-        ttk.Label(recognition, text="Поиск маленьких лиц:").grid(row=0, column=0, sticky="w", pady=3)
-        search_combo = ttk.Combobox(
-            recognition,
-            textvariable=self.search_mode_var,
-            values=list(SEARCH_MODES),
-            state="readonly",
-            width=15,
-        )
-        search_combo.grid(row=0, column=1, sticky="w", pady=3)
-        hint(
-            recognition,
-            "Определяет глубину поиска маленьких лиц; пользователь выбирает один из трёх режимов.\n"
-            "• Быстрый — только полный кадр, без тайлов. Самый быстрый, но чаще пропускает маленькие лица.\n"
-            "• Улучшенный — полный кадр + тайлы 1400 px с перекрытием 20%; рекомендуемый режим.\n"
-            "• Максимальный — полный кадр + тайлы 1000 px с перекрытием 24%; лучше для очень маленьких лиц, но медленнее.",
-        ).grid(row=0, column=2, sticky="w", padx=(3, 12))
+    def _scenario_changed(self):
+        self.filter_quality_var.set(self.scenario_var.get() == 'references')
+        self._refresh_workflow()
 
-        ttk.Label(recognition, text="Порог обнаружения лица:").grid(row=0, column=3, sticky="e", padx=(8, 5), pady=3)
-        ttk.Entry(recognition, textvariable=self.detector_threshold_var, width=8).grid(row=0, column=4, sticky="w", pady=3)
-        hint(
-            recognition,
-            "Минимальная уверенность SCRFD при первоначальном поиске лица. Допустимый диапазон ввода: 0.05…0.80.\n"
-            "Меньше значение → ищется больше слабых и маленьких лиц, но увеличивается число ложных кандидатов.\n"
-            "Больше значение → меньше ложных срабатываний, но выше риск потерять мелкие лица.\n"
-            "Практически полезный диапазон: 0.15…0.30. Значение по умолчанию: 0.18. Это НЕ критерий качества фотографии.",
-        ).grid(row=0, column=5, sticky="w", padx=(3, 12))
+    def _workflow(self):
+        return WorkflowOptions(scenario=self.scenario_var.get(), output=self.output_mode_var.get(),
+            destination=Path(self.destination_var.get()).expanduser().resolve() if self.destination_var.get().strip() else None,
+            transfer=self.transfer_var.get(), xmp_enabled=self.xmp_enabled_var.get(),
+            write_people=self.write_xmp_var.get(), best_frames=self.best_series_var.get(),
+            best_label=self.best_label_var.get(), filter_quality=self.filter_quality_var.get(),
+            detailed_csv=self.detailed_csv_var.get())
 
-        ttk.Label(recognition, text="Фильтр качества:").grid(row=0, column=6, sticky="e", padx=(8, 5), pady=3)
-        quality_combo = ttk.Combobox(
-            recognition,
-            textvariable=self.quality_preset_var,
-            values=list(QUALITY_PRESETS),
-            state="readonly",
-            width=13,
-        )
-        quality_combo.grid(row=0, column=7, sticky="w", pady=3)
-        add_tooltip(
-            quality_combo,
-            "Меняет числовую строгость критериев качества. Это не числовой ввод, а выбор из 3 пресетов.\n"
-            "• Мягкий: лицо от 35 px, yaw до 55°, pitch/roll до 45°, глаза от 0.080, blur от 25, clipped до 0.70.\n"
-            "• Нормальный: лицо от 45 px, yaw до 45°, pitch/roll до 35°, глаза от 0.105, blur от 45, clipped до 0.55.\n"
-            "• Строгий: лицо от 65 px, yaw до 30°, pitch/roll до 25°, глаза от 0.125, blur от 75, clipped до 0.35.\n"
-            "Сами критерии включаются и выключаются отдельными галочками ниже.",
-        )
+    def _refresh_workflow(self):
+        if not hasattr(self, 'start_btn'):
+            return
+        reference = self.scenario_var.get() == 'references'
+        self.ref_row.grid() if reference else self.ref_row.grid_remove()
+        self.scenario_hint.configure(text='Имена людей берутся из имён эталонных файлов. Эталоны ищутся во всех подпапках.' if reference
+            else 'Эталоны не нужны. Найденные люди получат обозначения Лицо_0001, Лицо_0002…')
+        mode = self.output_mode_var.get()
+        self.csv_row.grid() if mode == 'csv' else self.csv_row.grid_remove()
+        self.folder_rows.grid() if mode == 'folders' else self.folder_rows.grid_remove()
+        moving = self.transfer_var.get() == 'move'
+        self.transfer_hint.configure(text=('Фото и XMP удаляются из съёмки только после проверки всех копий. ' if moving else 'Исходники остаются на месте; XMP копируются вместе с фото. ')
+            + 'Групповой кадр попадёт в папку каждого найденного человека.')
+        enabled = self.xmp_enabled_var.get()
+        active = enabled and (self.write_xmp_var.get() or self.best_series_var.get())
+        if enabled and self.best_series_var.get():
+            note = f'Метка лучшего кадра: «{self.best_label_var.get()}» (меняется в настройках). Прежние цветовые метки будут заменены.'
+        elif enabled:
+            note = 'Список людей заменяется. Другие ключевые слова, цветовые метки, рейтинг и настройки Camera Raw сохраняются.'
+        else:
+            note = 'Существующие XMP не изменяются. При раскладке по папкам они переносятся вместе с фото.'
+        self.metadata_hint.configure(text=note)
+        problem = ''
+        if not self.photos_var.get().strip():
+            problem = 'Укажите папку фотографий съёмки.'
+        elif reference and not self.ref_var.get().strip():
+            problem = 'Укажите папку эталонных фото.'
+        elif mode == 'csv' and not self.output_var.get().strip():
+            problem = 'Укажите файл CSV.'
+        elif mode == 'folders' and not self.destination_var.get().strip():
+            problem = 'Выберите отдельную папку результата.'
+        elif enabled and not active:
+            problem = 'Выберите, что записывать в XMP.'
+        elif mode == 'analysis' and not active:
+            problem = 'Для «Только анализ» включите людей и/или цветовые метки XMP.'
+        elif enabled and self.best_series_var.get() and not self.best_label_var.get().strip():
+            problem = 'Укажите название цветовой метки в настройках.'
+        busy = bool(self.worker and self.worker.is_alive()) or getattr(self, '_starting', False)
+        for widget in self._main_controls:
+            widget.state(['disabled'] if busy else ['!disabled'])
+        self.people_check.state(['!disabled'] if enabled and not busy else ['disabled'])
+        self.best_check.state(['!disabled'] if enabled and not busy else ['disabled'])
+        self.start_btn.state(['disabled'] if problem or busy else ['!disabled'])
+        self.launch_hint.configure(text=problem or ('Перемещение: проверьте выбранную папку результата.' if mode == 'folders' and moving else ('Готово. Неудачные кадры исключаются из результата.' if self.filter_quality_var.get() else 'Готово. В результат попадут все уверенно распознанные кадры.')))
 
-        ttk.Label(recognition, text="Порог совпадения:").grid(row=1, column=0, sticky="w", pady=3)
-        ttk.Entry(recognition, textvariable=self.threshold_var, width=8).grid(row=1, column=1, sticky="w", pady=3)
-        hint(
-            recognition,
-            "Максимальная cosine distance до эталона. Допустимый диапазон ввода: 0.05…1.00.\n"
-            "Меньше значение → совпадение строже, ложных совпадений меньше, но часть правильных лиц может потеряться.\n"
-            "Больше значение → полнота выше, но возрастает риск ложных совпадений.\n"
-            "Практически полезный диапазон: 0.35…0.60. Значение по умолчанию: 0.45.",
-        ).grid(row=1, column=2, sticky="w", padx=(3, 12))
+    def _browse_destination(self):
+        value = filedialog.askdirectory(title='Папка результата — отдельно от исходников')
+        if value:
+            self.destination_var.set(value)
 
-        ttk.Label(recognition, text="Мин. отрыв от другой цели:").grid(row=1, column=3, sticky="e", padx=(8, 5), pady=3)
-        ttk.Entry(recognition, textvariable=self.margin_var, width=8).grid(row=1, column=4, sticky="w", pady=3)
-        hint(
-            recognition,
-            "Минимальный отрыв между лучшей целью и следующей ДРУГОЙ целью. Допустимый диапазон ввода: 0.00…0.50.\n"
-            "Если фактическая разница меньше этого значения, совпадение не назначается автоматически и уходит в review.csv.\n"
-            "0.00 — отключает этот дополнительный фильтр.\n"
-            "Практически полезный диапазон: 0.02…0.08. Значение по умолчанию: 0.04. Два эталона одной цели здесь не конкурируют друг с другом.",
-        ).grid(row=1, column=5, sticky="w", padx=(3, 12))
-
-        quality = ttk.LabelFrame(outer, text="Что считать неудачным фото", padding=10)
-        quality.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
-        for col in range(3):
-            quality.columnconfigure(col, weight=1)
-
-        q1 = ttk.Checkbutton(quality, text="Отбраковывать закрытые/сильно прищуренные глаза", variable=self.closed_eyes_var)
-        q1.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=3)
-        add_tooltip(q1, "Если включено, распознанная цель будет исключена из result.csv при подозрении на закрытые или сильно прищуренные глаза и попадёт в rejected.csv. Числовой порог задаётся выбранным пресетом качества: 0.080 / 0.105 / 0.125 для Мягкий / Нормальный / Строгий. Проверка эвристическая.")
-
-        q2 = ttk.Checkbutton(quality, text="Отбраковывать нерезкие лица", variable=self.blur_var)
-        q2.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=3)
-        add_tooltip(q2, "Если включено, нерезкие лица исключаются из result.csv и записываются в rejected.csv. Проверяется резкость области лица по variance of Laplacian. Порог зависит от пресета качества: 25 / 45 / 75 для Мягкий / Нормальный / Строгий. Чем выше порог, тем строже отбраковка.")
-
-        q3 = ttk.Checkbutton(quality, text="Отбраковывать сильный поворот/наклон", variable=self.pose_var)
-        q3.grid(row=0, column=2, sticky="w", pady=3)
-        add_tooltip(q3, "Если включено, лица с сильным поворотом или наклоном исключаются из result.csv и записываются в rejected.csv. Используются yaw / pitch / roll из InsightFace. Пороги по пресетам: yaw до 55° / 45° / 30°, pitch и roll до 45° / 35° / 25° для Мягкий / Нормальный / Строгий. Отключите, если нужны и выраженные профили.")
-
-        q4 = ttk.Checkbutton(quality, text="Отбраковывать слишком маленькие лица", variable=self.small_face_var)
-        q4.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=3)
-        add_tooltip(q4, "Если включено, распознанные, но слишком маленькие лица исключаются из result.csv и записываются в rejected.csv. Минимальный размер лица зависит от пресета качества: 35 / 45 / 65 px для Мягкий / Нормальный / Строгий. Это не мешает детектору сначала попытаться найти лицо.")
-
-        q5 = ttk.Checkbutton(quality, text="Отбраковывать плохую экспозицию", variable=self.exposure_var)
-        q5.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=3)
-        add_tooltip(q5, "Если включено, лица с сильным пересветом или провалом в тени исключаются из result.csv и записываются в rejected.csv. Используется доля пересвеченных/проваленных пикселей в области лица. Порог по пресетам: до 0.70 / 0.55 / 0.35 для Мягкий / Нормальный / Строгий. По умолчанию выключено, потому что критерий заметно зависит от конкретной съёмки.")
-
-        q6 = ttk.Checkbutton(quality, text="Отбраковывать обрезанную/слишком близкую к краю голову", variable=self.head_clip_var)
-        q6.grid(row=1, column=2, sticky="w", pady=3)
-        add_tooltip(q6, "Проверяет не только физическое пересечение головы с краем фотографии, но и композиционный отступ от края. Отступ адаптивный: чем меньшую долю кадра занимает лицо, тем дальше оно должно находиться от границы — это помогает исключать людей, случайно попавших сбоку/сверху кадра. Для крупного портрета требуемый отступ автоматически уменьшается. Строгость зависит от пресета качества.")
-
-        quality_note = ttk.Label(
-            quality,
-            text="Важно: включённый критерий качества исключает распознанную цель из основного CSV для этого фото и записывает причину в *_rejected.csv.",
-            wraplength=930,
-        )
-        quality_note.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
-        performance = ttk.LabelFrame(outer, text="Производительность и диагностика", padding=10)
-        performance.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
-        for col in range(8):
-            performance.columnconfigure(col, weight=1 if col in (1, 4) else 0)
-
-        ttk.Label(performance, text="Потоки декодирования:").grid(row=0, column=0, sticky="w", pady=3)
-        decode_spin = ttk.Spinbox(performance, from_=1, to=32, textvariable=self.decode_workers_var, width=7)
-        decode_spin.grid(row=0, column=1, sticky="w", pady=3)
-        hint(
-            performance,
-            "Количество CPU-потоков для чтения JPEG/HEIC/RAW. Допустимый диапазон ввода: 1…32.\n"
-            "Они работают параллельно с GPU. Больше потоков ускоряет подготовку файлов, но увеличивает расход RAM и нагрузку на диск.\n"
-            "Практически полезный диапазон: 4…8 для большинства ПК. Значение по умолчанию подбирается автоматически.",
-        ).grid(row=0, column=2, sticky="w", padx=(3, 15))
-
-        ttk.Label(performance, text="Параллельные GPU-сеансы:").grid(row=0, column=3, sticky="e", padx=(8, 5), pady=3)
-        inference_spin = ttk.Spinbox(performance, from_=1, to=8, textvariable=self.inference_workers_var, width=7)
-        inference_spin.grid(row=0, column=4, sticky="w", pady=3)
-        hint(
-            performance,
-            "Количество фотографий, одновременно проходящих InsightFace на GPU. Допустимый диапазон ввода: 1…8.\n"
-            "Больше потоков повышает загрузку GPU, но может увеличить расход VRAM и снизить стабильность на слабых картах.\n"
-            "Для RTX 5090 разумный старт: 2. Полезный диапазон для тестов: 1…4. Обычно имеет смысл увеличивать только если GPU недогружен.",
-        ).grid(row=0, column=5, sticky="w", padx=(3, 15))
-
-        c1 = ttk.Checkbutton(performance, text="Обрабатывать подпапки с фотографиями", variable=self.recursive_var)
-        c1.grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
-        add_tooltip(c1, "Искать целевые фотографии рекурсивно во всех подпапках. Папка эталонов всегда сканируется рекурсивно независимо от этой галочки.")
-
-        c2 = ttk.Checkbutton(performance, text="Требовать NVIDIA CUDA", variable=self.require_gpu_var)
-        c2.grid(row=1, column=2, columnspan=2, sticky="w", pady=3)
-        add_tooltip(c2, "Если включено, программа остановится, если CUDAExecutionProvider недоступен, вместо скрытого перехода на CPU.")
-
-        c3 = ttk.Checkbutton(performance, text="Подробная диагностика по каждому фото", variable=self.verbose_var)
-        c3.grid(row=1, column=4, columnspan=4, sticky="w", pady=3)
-        add_tooltip(c3, "Показывает в журнале: сколько лиц найдено полным кадром, сколько добавили тайлы, сколько осталось после NMS, сколько принято/отбраковано/отправлено на проверку.")
-
-        c4 = ttk.Checkbutton(
-            performance,
-            text="Определять серии фотографий и выбирать лучший кадр для каждой цели",
-            variable=self.best_series_var,
-        )
-        c4.grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 2))
-        add_tooltip(
-            c4,
-            "Создаёт дополнительный *_best.csv и не изменяет полный result.csv. "
-            "Серии определяются отдельно для каждой распознанной цели по последовательности кадров: "
-            "одна папка/камера, разрыв до 12 секунд и до 5 номеров файла. "
-            "Одиночные найденные кадры тоже сохраняются как серия из одного кадра. "
-            "Лучший кадр выбирается с приоритетом открытых глаз, затем резкости лица, "
-            "уверенности распознавания, ракурса и уверенности детектора. "
-            "Личность внутри серии не кластеризуется заново — используется уже подтверждённая цель ChildFaceFinder.",
-        )
-
-        c5 = ttk.Checkbutton(
-            performance,
-            text="Записывать найденных людей в XMP sidecar",
-            variable=self.write_xmp_var,
-        )
-        c5.grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 2))
-        add_tooltip(
-            c5,
-            "После завершения анализа создаёт или дополняет .xmp рядом с исходной фотографией. "
-            "В dc:subject записываются имена подтверждённых целей, а в Lightroom hierarchicalSubject — People|Имя. "
-            "RAW/JPEG/TIFF и другие исходники никогда не изменяются. Существующие XMP-данные сохраняются. "
-            "Без эталонов назначаются постоянные ID. Брак по качеству также записывается; неуверенные совпадения с эталонами пропускаются. Ошибка XMP не отменяет CSV.",
-        )
-
-        c6 = ttk.Checkbutton(
-            performance,
-            text="Добавлять XMP-метку ChildFaceFinder|Best для лучших кадров серий",
-            variable=self.xmp_mark_best_var,
-        )
-        c6.grid(row=4, column=0, columnspan=7, sticky="w", pady=(2, 2))
-        add_tooltip(
-            c6,
-            "Если одновременно включён выбор лучших кадров серий, добавляет hierarchical keyword "
-            "ChildFaceFinder|Best выбранным кадрам. Без выбора серий эта настройка ничего не меняет.",
-        )
-
-        buttons = ttk.Frame(outer)
-        buttons.grid(row=7, column=0, columnspan=3, sticky="ew", pady=4)
-        self.start_btn = ttk.Button(buttons, text="НАЧАТЬ АНАЛИЗ", command=self._start)
-        self.start_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(buttons, text="Отмена", command=self._cancel, state="disabled")
-        self.cancel_btn.pack(side="left", padx=8)
-        self.collect_btn = ttk.Button(buttons, text="Собрать файлы по CSV…", command=self._collect_files)
-        self.collect_btn.pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Рекомендуемые значения", command=self._reset_recommended).pack(side="left", padx=(0, 8))
-        ttk.Label(buttons, textvariable=self.status_var).pack(side="left", padx=12)
-
-        self.progress = ttk.Progressbar(outer, variable=self.progress_var, maximum=100.0)
-        self.progress.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(6, 8))
-
-        log_frame = ttk.LabelFrame(outer, text="Журнал", padding=5)
-        log_frame.grid(row=9, column=0, columnspan=3, sticky="nsew")
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled")
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=sb.set)
-        ttk.Button(log_frame, text="Очистить", command=self._clear_log).grid(row=1, column=0, sticky="e", pady=(5, 0))
-
-        ttk.Label(
-            outer,
-            text="Предобученные модели InsightFace имеют отдельные лицензионные ограничения; см. README.md.",
-            wraplength=950,
-        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(7, 0))
+    def _open_settings(self):
+        if self.worker and self.worker.is_alive():
+            return
+        names = ('search_mode_var', 'detector_threshold_var', 'quality_preset_var', 'threshold_var', 'margin_var',
+                 'closed_eyes_var', 'blur_var', 'pose_var', 'small_face_var', 'exposure_var', 'head_clip_var',
+                 'decode_workers_var', 'inference_workers_var', 'require_gpu_var', 'verbose_var',
+                 'filter_quality_var', 'detailed_csv_var', 'best_label_var')
+        before = {name: getattr(self, name).get() for name in names}
+        dialog = tk.Toplevel(self)
+        dialog.withdraw()
+        dialog.title('Настройки обработки')
+        dialog.geometry('760x510')
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        tabs = ttk.Notebook(dialog)
+        tabs.pack(fill='both', expand=True, padx=12, pady=12)
+        pages = {}
+        for name in ('Распознавание', 'Отбор кадров', 'Производительность', 'Вывод и XMP'):
+            page = ttk.Frame(tabs, padding=14)
+            page.columnconfigure(1, weight=1)
+            tabs.add(page, text=name)
+            pages[name] = page
+        def field(page, row, label, variable, values=None):
+            ttk.Label(page, text=label).grid(row=row, column=0, sticky='w', padx=(0, 15), pady=7)
+            widget = ttk.Combobox(page, textvariable=variable, values=values, state='readonly', width=24) if values else ttk.Entry(page, textvariable=variable, width=26)
+            widget.grid(row=row, column=1, sticky='w', pady=7)
+        page = pages['Распознавание']
+        field(page, 0, 'Поиск небольших лиц', self.search_mode_var, list(SEARCH_MODES))
+        field(page, 1, 'Порог обнаружения (0.05–0.80)', self.detector_threshold_var)
+        field(page, 2, 'Порог совпадения (0.05–1.00)', self.threshold_var)
+        field(page, 3, 'Отрыв от другого человека (0–0.50)', self.margin_var)
+        ttk.Label(page, text='Меньше порог совпадения — строже распознавание.\nСомнительные лица не получают чужое имя. Рекомендуемые значения подходят для первого запуска.', wraplength=670).grid(row=4, column=0, columnspan=2, sticky='w', pady=14)
+        page = pages['Отбор кадров']
+        field(page, 0, 'Строгость оценки качества', self.quality_preset_var, list(QUALITY_PRESETS))
+        ttk.Checkbutton(page, text='Исключать неудачные кадры из CSV и папок людей', variable=self.filter_quality_var).grid(row=1, column=0, columnspan=2, sticky='w', pady=7)
+        for row, (label, variable) in enumerate([
+            ('Закрытые глаза', self.closed_eyes_var), ('Нерезкое лицо', self.blur_var),
+            ('Сильный поворот головы', self.pose_var), ('Слишком маленькое лицо', self.small_face_var),
+            ('Плохая экспозиция', self.exposure_var), ('Голова обрезана или близко к краю', self.head_clip_var)], start=2):
+            ttk.Checkbutton(page, text=label, variable=variable).grid(row=row, column=0, columnspan=2, sticky='w', pady=2)
+        ttk.Label(page, text='Этот отбор не влияет на список людей в XMP.\nПри включённом отборе неудачные кадры также не участвуют в выборе лучших.', wraplength=670).grid(row=8, column=0, columnspan=2, sticky='w', pady=12)
+        page = pages['Производительность']
+        field(page, 0, 'Потоки декодирования (1–32)', self.decode_workers_var)
+        field(page, 1, 'Параллельные GPU-сеансы (1–8)', self.inference_workers_var)
+        ttk.Checkbutton(page, text='Требовать NVIDIA CUDA', variable=self.require_gpu_var).grid(row=2, column=0, columnspan=2, sticky='w', pady=10)
+        ttk.Checkbutton(page, text='Подробный журнал по каждому фото', variable=self.verbose_var).grid(row=3, column=0, columnspan=2, sticky='w', pady=10)
+        ttk.Label(page, text='Для RTX 5090 начните с 2 GPU-сеансов. Увеличение числа потоков повышает расход памяти.', wraplength=660).grid(row=4, column=0, columnspan=2, sticky='w', pady=15)
+        page = pages['Вывод и XMP']
+        field(page, 0, 'Название метки лучшего кадра в Bridge', self.best_label_var)
+        def label_from_xmp():
+            path = filedialog.askopenfilename(parent=dialog, title='XMP снимка с нужной цветовой меткой', filetypes=[('XMP', '*.xmp *.XMP')])
+            if not path:
+                return
+            try:
+                import xml.etree.ElementTree as ET
+                from metadata_writer import XMP_NS
+                root = ET.parse(path).getroot()
+                values = [node.attrib.get(f'{{{XMP_NS}}}Label') for node in root.iter()]
+                values += [node.text for node in root.iter(f'{{{XMP_NS}}}Label')]
+                label = next((v for v in values if v and v.strip()), None)
+                if not label:
+                    raise ValueError('В выбранном XMP нет цветовой метки')
+                self.best_label_var.set(label)
+            except Exception as exc:
+                messagebox.showerror('Цветовая метка', str(exc), parent=dialog)
+        ttk.Button(page, text='Взять название из готового XMP…', command=label_from_xmp).grid(row=1, column=0, columnspan=2, sticky='w', pady=5)
+        ttk.Label(page, text='Bridge определяет цвет по названию метки в своих установках.\nSelect — лишь исходное значение; можно взять точное название из вашего XMP.\n\nЦвет относится ко всему файлу: групповой кадр отмечается, если он лучший хотя бы для одного человека.', wraplength=670).grid(row=2, column=0, columnspan=2, sticky='w', pady=12)
+        ttk.Checkbutton(page, text='Дополнительные CSV: брак, сомнения и лучшие кадры', variable=self.detailed_csv_var).grid(row=3, column=0, columnspan=2, sticky='w', pady=10)
+        ttk.Label(page, text='Дополнительные отчёты создаются только при результате «Список CSV».\nПри копировании/перемещении создаётся журнал операций JSON.', wraplength=670).grid(row=4, column=0, columnspan=2, sticky='w')
+        buttons = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        buttons.pack(fill='x')
+        def close(apply):
+            if apply:
+                try:
+                    self._make_settings()
+                except Exception as exc:
+                    messagebox.showerror('Настройки', str(exc), parent=dialog)
+                    return
+                self._save_settings()
+            else:
+                for name, value in before.items():
+                    getattr(self, name).set(value)
+            dialog.grab_release()
+            dialog.destroy()
+            self._refresh_workflow()
+        ttk.Button(buttons, text='Рекомендуемые значения', command=self._reset_recommended).pack(side='left')
+        ttk.Button(buttons, text='Применить', command=lambda: close(True)).pack(side='right')
+        ttk.Button(buttons, text='Отмена', command=lambda: close(False)).pack(side='right', padx=8)
+        dialog.protocol('WM_DELETE_WINDOW', lambda: close(False))
+        dialog.bind('<Escape>', lambda event: close(False))
+        self.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - 760) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 510) // 2
+        dialog.geometry(f'760x510+{x}+{y}')
+        dialog.deiconify()
+        dialog.grab_set()
 
     def _browse_refs(self) -> None:
         value = filedialog.askdirectory(title="Папка с эталонами")
@@ -464,6 +498,9 @@ class App(tk.Tk):
             self.photos_var.set(value)
             if not self.output_var.get().strip():
                 self.output_var.set(str(Path(value) / "result.csv"))
+            if not self.destination_var.get().strip():
+                folder = Path(value)
+                self.destination_var.set(str(folder.parent / (folder.name + '_по_людям')))
 
     def _browse_output(self) -> None:
         value = filedialog.asksaveasfilename(
@@ -578,16 +615,24 @@ class App(tk.Tk):
         self.head_clip_var.set(True)
         self.decode_workers_var.set(max(2, min(8, os.cpu_count() or 4)))
         self.inference_workers_var.set(2)
-        self.recursive_var.set(True)
         self.require_gpu_var.set(True)
         self.verbose_var.set(True)
-        self.best_series_var.set(False)
-        self.write_xmp_var.set(False)
-        self.xmp_mark_best_var.set(False)
+        self.filter_quality_var.set(self.scenario_var.get() == 'references')
+        self.detailed_csv_var.set(False)
+        self.best_label_var.set('Select')
         self.status_var.set("Восстановлены рекомендуемые значения")
 
     def _settings_snapshot(self) -> dict[str, object]:
         return {
+            'scenario': self.scenario_var.get(),
+            'output_mode': self.output_mode_var.get(),
+            'destination': self.destination_var.get().strip(),
+            'transfer': self.transfer_var.get(),
+            'xmp_enabled': self.xmp_enabled_var.get(),
+            'write_people': self.write_xmp_var.get(),
+            'best_label': self.best_label_var.get(),
+            'filter_quality': self.filter_quality_var.get(),
+            'detailed_csv': self.detailed_csv_var.get(),
             "reference_folder": self.ref_var.get().strip(),
             "photo_folder": self.photos_var.get().strip(),
             "output_csv": self.output_var.get().strip(),
@@ -632,6 +677,7 @@ class App(tk.Tk):
         quality = QUALITY_PRESETS[self.quality_preset_var.get()]
         search = SEARCH_MODES[self.search_mode_var.get()]
         return Settings(
+            workflow=self._workflow(),
             match_threshold=self._parse_float(self.threshold_var.get(), "Порог совпадения", 0.05, 1.0),
             ambiguity_margin=self._parse_float(self.margin_var.get(), "Отрыв от второй цели", 0.0, 0.5),
             detector_threshold=self._parse_float(self.detector_threshold_var.get(), "Порог детектора", 0.05, 0.8),
@@ -670,26 +716,29 @@ class App(tk.Tk):
             xmp_mark_best=self.xmp_mark_best_var.get(),
         )
 
-    def _validate_paths(self) -> tuple[Path | None, Path, Path]:
-        ref_text = self.ref_var.get().strip()
+    def _validate_paths(self):
         photos_text = self.photos_var.get().strip()
-        output_text = self.output_var.get().strip()
-        if not ref_text and not self.write_xmp_var.get():
-            raise ValueError("Укажите папку эталонов или включите запись лиц в метаданные")
         if not photos_text:
-            raise ValueError("Укажите папку фотографий")
-        if not output_text:
-            raise ValueError("Укажите CSV результата")
-        refs = Path(ref_text).expanduser() if ref_text else None
-        photos = Path(photos_text).expanduser()
-        output = Path(output_text).expanduser()
-        if refs is not None and not refs.is_dir():
-            raise ValueError("Укажите существующую папку эталонов")
+            raise ValueError('Укажите папку фотографий')
+        photos = Path(photos_text).expanduser().resolve()
+        refs = None
+        if self.scenario_var.get() == 'references':
+            if not self.ref_var.get().strip():
+                raise ValueError('Укажите папку эталонных фото')
+            refs = Path(self.ref_var.get().strip()).expanduser().resolve()
+            if not refs.is_dir():
+                raise ValueError('Папка эталонов не существует')
         if not photos.is_dir():
-            raise ValueError("Укажите существующую папку фотографий")
-        if output.suffix.casefold() != ".csv":
-            output = output.with_suffix(".csv")
-            self.output_var.set(str(output))
+            raise ValueError('Папка фотографий не существует')
+        output = None
+        if self.output_mode_var.get() == 'csv':
+            if not self.output_var.get().strip():
+                raise ValueError('Укажите файл CSV')
+            output = Path(self.output_var.get().strip()).expanduser().resolve()
+            if output.suffix.casefold() != '.csv':
+                output = output.with_suffix('.csv')
+                self.output_var.set(str(output))
+        self._workflow().validate(refs, photos, output)
         return refs, photos, output
 
     def _start(self) -> None:
@@ -732,6 +781,7 @@ class App(tk.Tk):
 
         self.worker = threading.Thread(target=task, name="cff-main", daemon=True)
         self.worker.start()
+        self._refresh_workflow()
 
     def _cancel(self) -> None:
         if self.finder is not None:
@@ -752,12 +802,13 @@ class App(tk.Tk):
         self.cancel_btn.configure(state="disabled")
         self.finder = None
         self.worker = None
+        self._refresh_workflow()
         if self.closing_after_cancel:
             self.destroy()
 
     def _poll_events(self) -> None:
         try:
-            while True:
+            for _ in range(200):
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == "log":
@@ -767,40 +818,30 @@ class App(tk.Tk):
                     self.progress_var.set(0.0 if total <= 0 else done * 100.0 / total)
                     self.status_var.set(f"{done}/{total}: {name}")
                 elif kind == "done":
-                    summary: RunSummary = event[1]
-                    self.progress_var.set(100.0)
-                    self.status_var.set("Готово")
-                    self._append_log(
-                        f"Готово. Целей: {summary.reference_ids}; эталонных файлов: {summary.reference_files}; "
-                        f"фото: {summary.photo_count}; совпадений: {summary.matched_pairs}; "
-                        f"отбраковано: {summary.rejected_pairs}; на проверку: {summary.review_rows}."
-                        + (f" Лучших кадров серий: {summary.best_series_count}." if summary.best_csv is not None else "")
-                        + (
-                            f" XMP: записано {summary.xmp_written}, без изменений {summary.xmp_unchanged}, "
-                            f"ошибок {summary.xmp_failed}."
-                            if self.write_xmp_var.get() else ""
-                        )
-                    )
+                    summary = event[1]
+                    self.progress_var.set(100)
+                    self.status_var.set('Готово')
+                    lines = [f'Найдено людей: {summary.found_people}',
+                             f'Лиц определено: {summary.identified_faces}; не определено: {summary.unidentified_faces}',
+                             f'Фотографий для проверки: {summary.review_photos}']
+                    if summary.output_csv is not None:
+                        lines += ['', f'Список CSV: {summary.output_csv}']
+                    if summary.destination is not None:
+                        lines += ['', f'Папка результата: {summary.destination}',
+                                  f'Копий: {summary.file_copies}; исходников перемещено: {summary.file_moves}; ошибок: {summary.file_errors}',
+                                  f'Журнал операций: {summary.transfer_journal}']
+                    if summary.best_series_count:
+                        lines.append(f'Лучших кадров для людей/серий: {summary.best_series_count}')
+                    if summary.xmp_enabled:
+                        lines.append(f'XMP: обновлено {summary.xmp_written}; без изменений {summary.xmp_unchanged}; ошибок {summary.xmp_failed}')
+                    if summary.review_csv is not None:
+                        lines.append(f'Отчёт проверки: {summary.review_csv}')
+                    result = '\n'.join(lines)
+                    self._append_log(result)
                     self._finish_ui()
-                    if not self.closing_after_cancel:
-                        messagebox.showinfo(
-                            APP_TITLE,
-                            "Обработка завершена.\n\n"
-                            f"Основной CSV:\n{summary.output_csv}\n\n"
-                            f"Отбракованные:\n{summary.rejected_csv}\n\n"
-                            f"Сомнительные совпадения:\n{summary.review_csv}"
-                            + (
-                                f"\n\nЛучшие кадры серий:\n{summary.best_csv}\n"
-                                f"Выбрано серий: {summary.best_series_count}"
-                                if summary.best_csv is not None else ""
-                            )
-                            + (
-                                f"\n\nXMP sidecar: записано {summary.xmp_written}; "
-                                f"без изменений {summary.xmp_unchanged}; ошибок {summary.xmp_failed}."
-                                if self.write_xmp_var.get() else ""
-                            ),
-                            parent=self,
-                        )
+                    if self.closing_after_cancel:
+                        return
+                    messagebox.showinfo('Обработка завершена', result, parent=self)
                 elif kind == "collector_progress":
                     _, done, total, name = event
                     if total > 0:
@@ -888,11 +929,15 @@ class App(tk.Tk):
                     self.status_var.set("Отменено")
                     self._append_log(event[1])
                     self._finish_ui()
+                    if self.closing_after_cancel:
+                        return
                 elif kind == "error":
                     _, text, details = event
                     self.status_var.set("Ошибка")
                     self._append_log(details)
                     self._finish_ui()
+                    if self.closing_after_cancel:
+                        return
                     if not self.closing_after_cancel:
                         messagebox.showerror(APP_TITLE, text, parent=self)
         except queue.Empty:

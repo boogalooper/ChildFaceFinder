@@ -4,12 +4,11 @@ import copy
 import csv
 import math
 import os
-import queue
 import re
 import threading
 import unicodedata
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -20,7 +19,10 @@ import numpy as np
 from image_loader import cleanup_stale_temp_dirs, decode_image, iter_candidate_files, make_system_temp_dir
 from model_setup import INSIGHTFACE_ROOT, MODEL_NAME, ensure_antelopev2
 from metadata_writer import XmpMetadataWriter
-from identity_catalog import assign_identities
+from runtime_safety import atomic_path, guarded_run
+from workflow import WorkflowOptions
+from file_output import export_people
+from identity_catalog import assign_identities, recognition_issues, unique_photo_matches
 from series_selector import BestFrameCandidate, select_best_series_frames
 
 cv2.setNumThreads(1)
@@ -33,6 +35,7 @@ LEADING_REFERENCE_LETTER = re.compile(r"^\s*[A-Z]\s+(.+?)\s*$")
 
 @dataclass(slots=True)
 class Settings:
+    workflow: WorkflowOptions | None = None
     match_threshold: float = 0.45
     ambiguity_margin: float = 0.04
     detector_threshold: float = 0.18
@@ -138,14 +141,25 @@ class RunSummary:
     matched_pairs: int
     rejected_pairs: int
     review_rows: int
-    output_csv: Path
-    rejected_csv: Path
-    review_csv: Path
+    output_csv: Path | None
+    rejected_csv: Path | None
+    review_csv: Path | None
     best_csv: Path | None = None
     best_series_count: int = 0
     xmp_written: int = 0
     xmp_unchanged: int = 0
     xmp_failed: int = 0
+    xmp_enabled: bool = False
+    detected_faces: int = 0
+    identified_faces: int = 0
+    unidentified_faces: int = 0
+    found_people: int = 0
+    review_photos: int = 0
+    file_copies: int = 0
+    file_moves: int = 0
+    file_errors: int = 0
+    destination: Path | None = None
+    transfer_journal: Path | None = None
 
 
 class CancelledError(RuntimeError):
@@ -459,9 +473,10 @@ def _nms_records(records: list[FaceRecord | FaceCandidate], threshold: float) ->
 
 
 class FaceEngine:
-    def __init__(self, settings: Settings, log: Callable[[str], None] | None = None):
+    def __init__(self, settings: Settings, log: Callable[[str], None] | None = None, check_cancel=None):
         self.settings = settings
         self.log = log or (lambda _: None)
+        self.check_cancel = check_cancel or (lambda: None)
         self.analyzer = None
         self.detector = None
         self.recognition_model = None
@@ -471,7 +486,9 @@ class FaceEngine:
 
     def initialize(self) -> None:
         self.log("Проверка модели antelopev2...")
+        self.check_cancel()
         ensure_antelopev2()
+        self.check_cancel()
 
         import onnxruntime as ort
 
@@ -556,7 +573,7 @@ class FaceEngine:
         raw_bbox: tuple[float, float, float, float], image_w: int, image_h: int
     ) -> tuple[int, int, int, int] | None:
         rx1, ry1, rx2, ry2 = raw_bbox
-        if not np.isfinite([rx1, ry1, rx2, ry2]).all():
+        if not np.isfinite([rx1, ry1, rx2, ry2]).all() or rx2 <= rx1 or ry2 <= ry1 or rx2 <= 0 or ry2 <= 0 or rx1 >= image_w or ry1 >= image_h:
             return None
         x1 = max(0, min(image_w - 1, int(round(rx1))))
         y1 = max(0, min(image_h - 1, int(round(ry1))))
@@ -586,7 +603,7 @@ class FaceEngine:
             if row.size < 5:
                 continue
             lx1, ly1, lx2, ly2, score = map(float, row[:5])
-            if score < rescue_threshold:
+            if not np.isfinite(score) or not 0 <= score <= 1 or score < rescue_threshold:
                 continue
             fw = max(1.0, lx2 - lx1)
             fh = max(1.0, ly2 - ly1)
@@ -810,12 +827,14 @@ class FaceEngine:
         crops: list[np.ndarray] = []
         input_size = int(getattr(self.recognition_model, "input_size", (112, 112))[0])
         for face in faces:
+            self.check_cancel()
             crops.append(face_align.norm_crop(image, landmark=face.kps, image_size=input_size))
 
         batch_size = max(1, int(self.settings.recognition_batch_size))
         try:
             embeddings: list[np.ndarray] = []
             for start in range(0, len(crops), batch_size):
+                self.check_cancel()
                 chunk = crops[start:start + batch_size]
                 features = np.asarray(self.recognition_model.get_feat(chunk), dtype=np.float32)
                 if features.ndim == 1:
@@ -825,14 +844,18 @@ class FaceEngine:
                 raise RuntimeError("ArcFace вернул неверное число embeddings")
             for face, embedding in zip(faces, embeddings):
                 face.embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        except CancelledError:
+            raise
         except Exception as batch_error:
             self.log(f"Batch ArcFace недоступен ({batch_error}); fallback на одиночный режим")
             for face in faces:
+                self.check_cancel()
                 self.recognition_model.get(image, face)
 
         # Landmarks запускаются только для уже дедуплицированных лиц.
         for face in faces:
             for model in self.landmark_models:
+                self.check_cancel()
                 model.get(image, face)
 
         records: list[FaceRecord] = []
@@ -883,6 +906,7 @@ class FaceEngine:
 
         for y0 in ys:
             for x0 in xs:
+                self.check_cancel()
                 x1 = min(w, x0 + tile_size)
                 y1 = min(h, y0 + tile_size)
                 if x0 == 0 and y0 == 0 and x1 == w and y1 == h:
@@ -940,87 +964,71 @@ class ChildFaceFinder:
         self.log = log or (lambda _: None)
         self.progress = progress or (lambda _a, _b, _c: None)
         self.cancel_event = threading.Event()
-        self.engine = FaceEngine(settings, self.log)
+        self.engine = FaceEngine(settings, self.log, self._check_cancel)
 
     def cancel(self) -> None:
         self.cancel_event.set()
 
+    def _check_cancel(self):
+        if self.cancel_event.is_set():
+            raise CancelledError("Обработка отменена; ранее записанные результаты сохранены")
+
     def _pipeline(self, paths: list[Path], temp_dir: Path, references: bool = False) -> Iterable[ImageAnalysis]:
         if not paths:
             return
-
-        path_q: queue.Queue[Path | None] = queue.Queue()
-        max_images_in_flight = max(2, self.settings.inference_workers * 2)
-        decoded_q: queue.Queue[tuple[Path, np.ndarray | None, str | None] | None] = queue.Queue(maxsize=max_images_in_flight)
-        image_slots = threading.Semaphore(max_images_in_flight)
-        result_q: queue.Queue[ImageAnalysis] = queue.Queue()
-
-        for path in paths:
-            path_q.put(path)
-        for _ in range(self.settings.decode_workers):
-            path_q.put(None)
-
-        decoders_left = self.settings.decode_workers
-        decoder_lock = threading.Lock()
-
-        def decoder_worker() -> None:
-            nonlocal decoders_left
+        if self.settings.decode_workers < 1 or self.settings.inference_workers < 1:
+            raise ValueError("Число рабочих потоков должно быть положительным")
+        limit = max(2, self.settings.inference_workers * 2)
+        remaining = iter(enumerate(paths))
+        pending = {}
+        def infer(image, path):
+            self._check_cancel()
+            return self.engine.analyze_reference(image, path) if references else self.engine.analyze(image, path)
+        # Futures report failures directly; no missing queue item can block a consumer.
+        with ThreadPoolExecutor(max_workers=self.settings.decode_workers, thread_name_prefix="cff-decode") as decoders, \
+             ThreadPoolExecutor(max_workers=self.settings.inference_workers, thread_name_prefix="cff-infer") as inference:
+            def fill():
+                while len(pending) < limit:
+                    self._check_cancel()
+                    item = next(remaining, None)
+                    if item is None:
+                        return
+                    index, path = item
+                    pending[decoders.submit(decode_image, path, temp_dir)] = (index, path, False)
             try:
-                while True:
-                    path = path_q.get()
-                    if path is None:
-                        break
-                    if self.cancel_event.is_set():
-                        decoded_q.put((path, None, "отменено"))
-                        continue
-                    image_slots.acquire()
-                    if self.cancel_event.is_set():
-                        image_slots.release()
-                        decoded_q.put((path, None, "отменено"))
-                        continue
-                    try:
-                        img = decode_image(path, temp_dir)
-                        decoded_q.put((path, img, None))
-                    except Exception as exc:
-                        image_slots.release()
-                        decoded_q.put((path, None, str(exc)))
+                fill()
+                while pending:
+                    self._check_cancel()
+                    done = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED).done
+                    for future in sorted(done, key=lambda f: pending[f][0]):
+                        index, path, analyzed = pending.pop(future)
+                        self._check_cancel()
+                        try:
+                            try:
+                                value = future.result()
+                            except (SystemExit, KeyboardInterrupt) as exc:
+                                raise RuntimeError(f"Рабочий поток аварийно завершился: {type(exc).__name__}: {exc}") from exc
+                            if analyzed:
+                                if not isinstance(value, ImageAnalysis):
+                                    raise RuntimeError("Модель вернула некорректный результат анализа")
+                                yield value
+                            else:
+                                if not isinstance(value, np.ndarray) or value.ndim != 3 or value.shape[2] != 3 or not value.size:
+                                    raise ValueError("Декодер вернул пустое или некорректное изображение")
+                                pending[inference.submit(infer, value, path)] = (index, path, True)
+                        except CancelledError:
+                            raise
+                        except Exception as exc:
+                            yield ImageAnalysis(path=path, faces=[], error=str(exc))
+                        finally:
+                            # A completed decoding Future owns its image until released.
+                            value = None
+                    done.clear()
+                    future = None
+                    fill()
             finally:
-                with decoder_lock:
-                    decoders_left -= 1
-                    if decoders_left == 0:
-                        for _ in range(self.settings.inference_workers):
-                            decoded_q.put(None)
-
-        def inference_worker() -> None:
-            while True:
-                item = decoded_q.get()
-                if item is None:
-                    return
-                path, image, error = item
-                if error is not None or image is None:
-                    result_q.put(ImageAnalysis(path=path, faces=[], error=error or "ошибка декодирования"))
-                    continue
-                try:
-                    if self.cancel_event.is_set():
-                        result_q.put(ImageAnalysis(path=path, faces=[], error="отменено"))
-                        continue
-                    try:
-                        analysis = self.engine.analyze_reference(image, path) if references else self.engine.analyze(image, path)
-                        result_q.put(analysis)
-                    except Exception as exc:
-                        result_q.put(ImageAnalysis(path=path, faces=[], error=str(exc)))
-                finally:
-                    del image
-                    image_slots.release()
-
-        total_workers = self.settings.decode_workers + self.settings.inference_workers
-        with ThreadPoolExecutor(max_workers=total_workers, thread_name_prefix="cff") as executor:
-            decoder_futures = [executor.submit(decoder_worker) for _ in range(self.settings.decode_workers)]
-            inference_futures = [executor.submit(inference_worker) for _ in range(self.settings.inference_workers)]
-            for _ in range(len(paths)):
-                yield result_q.get()
-            for future in decoder_futures + inference_futures:
-                future.result()
+                for future in pending:
+                    future.cancel()
 
     def _build_references(self, folder: Path, temp_dir: Path) -> ReferenceSet:
         # Эталонная папка всегда сканируется рекурсивно: поза/тип кадра может
@@ -1075,7 +1083,7 @@ class ChildFaceFinder:
         ref_person_indices: list[int] = []
 
         for key in valid_keys:
-            refs = embeddings[key]
+            refs = sorted(embeddings[key], key=lambda pair: (str(pair[1]).casefold(), str(pair[1])))
             if len(refs) > 1:
                 ref_vectors = np.stack([vector for vector, _ in refs], axis=0).astype(np.float32, copy=False)
                 distances = 1.0 - np.matmul(ref_vectors, ref_vectors.T)
@@ -1110,10 +1118,17 @@ class ChildFaceFinder:
         face: FaceRecord,
         references: ReferenceSet,
     ) -> tuple[str | None, str, float, str | None, float | None, str | None]:
-        ref_distances = 1.0 - np.matmul(references.matrix, face.embedding)
+        if not references.person_ids or not references.matrix.size:
+            return None, "", float("inf"), None, None, "нет образцов для сравнения"
+        vector = _l2_normalize(face.embedding)
+        if references.matrix.ndim != 2 or references.matrix.shape[1] != len(vector):
+            raise ValueError("Несовместимые размеры embeddings лица и эталонов")
+        ref_distances = np.clip(1.0 - np.matmul(references.matrix, vector), 0.0, 2.0)
+        if not np.isfinite(ref_distances).all():
+            raise ValueError("Некорректные embeddings эталонов")
         person_distances = np.full(len(references.person_ids), np.inf, dtype=np.float32)
         np.minimum.at(person_distances, references.ref_person_indices, ref_distances)
-        order = np.argsort(person_distances)
+        order = np.argsort(person_distances, kind="stable")
         best_idx = int(order[0])
         best_id = references.person_ids[best_idx]
         best_dist = float(person_distances[best_idx])
@@ -1126,27 +1141,31 @@ class ChildFaceFinder:
 
         if best_dist > self.settings.match_threshold:
             return None, best_id, best_dist, second_id, second_dist, "дистанция выше порога"
-        if second_dist is not None and (second_dist - best_dist) < self.settings.ambiguity_margin:
+        if second_dist is not None and (second_dist - best_dist) < max(1e-6, self.settings.ambiguity_margin):
             return None, best_id, best_dist, second_id, second_dist, "слишком близкая вторая цель"
         return best_id, best_id, best_dist, second_id, second_dist, None
 
     @staticmethod
     def _write_csv_atomic(path: Path, header: list[str], rows: list[list[object]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_name(path.name + ".tmp")
-        try:
+        with atomic_path(path) as temp:
             with temp.open("w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f, delimiter=";", lineterminator="\n")
                 writer.writerow(header)
                 writer.writerows(rows)
-            os.replace(temp, path)
-        finally:
-            temp.unlink(missing_ok=True)
 
-    def run(self, references_dir: Path | None, photos_dir: Path, output_csv: Path) -> RunSummary:
-        self.cancel_event.clear()
-        if references_dir is None and not self.settings.write_xmp_tags:
+    @guarded_run
+    def run(self, references_dir: Path | None, photos_dir: Path, output_csv: Path | None) -> RunSummary:
+        self._check_cancel()
+        workflow = getattr(self.settings, 'workflow', None)
+        if workflow is not None:
+            workflow.validate(references_dir, photos_dir, output_csv)
+        elif references_dir is None and not self.settings.write_xmp_tags:
             raise ValueError("Без эталонов необходимо включить запись XMP")
+        csv_enabled = workflow is None or workflow.output == 'csv'
+        details_enabled = workflow is None or workflow.detailed_csv
+        xmp_enabled = self.settings.write_xmp_tags if workflow is None else (workflow.people_enabled or workflow.labels_enabled)
+        select_best = self.settings.select_best_series if workflow is None else workflow.labels_enabled
 
         removed_temp, failed_temp = cleanup_stale_temp_dirs()
         if removed_temp:
@@ -1155,6 +1174,7 @@ class ChildFaceFinder:
             self.log(f"TEMP: не удалось удалить {path}: {error}")
 
         self.engine.initialize()
+        self._check_cancel()
 
         with make_system_temp_dir() as temp_name:
             temp_dir = Path(temp_name)
@@ -1162,10 +1182,13 @@ class ChildFaceFinder:
             references = self._build_references(references_dir, temp_dir) if references_dir is not None else None
 
             photo_paths = iter_candidate_files(photos_dir, self.settings.recursive)
+            if references_dir is not None and references_dir != photos_dir:
+                photo_paths = [p for p in photo_paths if references_dir not in p.resolve().parents]
             if not photo_paths:
-                raise RuntimeError("В папке фотографий нет файлов")
+                raise RuntimeError("В папке фотографий нет файлов съёмки")
 
             analyses: list[ImageAnalysis] = []
+            failed_analyses = []
             done = 0
             for analysis in self._pipeline(photo_paths, temp_dir, references=False):
                 done += 1
@@ -1173,6 +1196,7 @@ class ChildFaceFinder:
                 if analysis.error:
                     if analysis.error != "отменено":
                         self.log(f"{analysis.path.name}: {analysis.error}")
+                        failed_analyses.append(analysis)
                     continue
                 analyses.append(analysis)
                 if self.settings.verbose_diagnostics:
@@ -1186,7 +1210,11 @@ class ChildFaceFinder:
             if self.cancel_event.is_set():
                 raise CancelledError("Обработка отменена")
 
+            if not analyses:
+                raise RuntimeError("Ни одну фотографию не удалось обработать. Проверьте журнал; предыдущие результаты не изменены.")
+            analyses.sort(key=lambda a: (str(a.path).casefold(), str(a.path)))
             discovered = {}
+            discovery_details = {}
             if references is None:
                 def check_cancel():
                     if self.cancel_event.is_set():
@@ -1194,6 +1222,10 @@ class ChildFaceFinder:
                 names, vectors, discovered = assign_identities(
                     analyses, photos_dir, self.settings.match_threshold,
                     self.settings.ambiguity_margin, check_cancel,
+                    details=discovery_details,
+                    min_face_px=self.settings.min_face_px,
+                    blur_threshold=self.settings.blur_threshold,
+                    log=self.log,
                 )
                 references = ReferenceSet(
                     person_ids=names,
@@ -1211,13 +1243,24 @@ class ChildFaceFinder:
             for analysis_index, analysis in enumerate(analyses):
                 rows = []
                 for face in analysis.faces:
-                    info = ((discovered[id(face)], discovered[id(face)], 0.0, None, None, None)
-                            if discovered else self._match_face(face, references))
+                    if self.cancel_event.is_set():
+                        raise CancelledError("Обработка отменена")
+                    if references_dir is None:
+                        info = discovery_details[id(face)]
+                    else:
+                        issues = recognition_issues(face, min_face_px=self.settings.min_face_px,
+                                                    blur_threshold=self.settings.blur_threshold)
+                        info = ((None, "", float("inf"), None, None, "; ".join(issues))
+                                if issues else self._match_face(face, references))
                     rows.append((face, info))
+                rows = unique_photo_matches(rows, self.settings.ambiguity_margin)
+                for face, info in rows:
                     person_id, _best_id, dist, _second_id, _second_dist, _problem = info
                     if (
-                        person_id is not None
-                        and not face.quality_reasons
+                        references_dir is not None
+                        and person_id is not None
+                        and not recognition_issues(face, anchor=True, min_face_px=self.settings.min_face_px,
+                                                   blur_threshold=self.settings.blur_threshold)
                         and not face.source.startswith("rescue-")
                         and face.det_score >= max(0.40, self.settings.detector_threshold)
                         and dist <= anchor_limit_distance
@@ -1256,9 +1299,16 @@ class ChildFaceFinder:
 
             matches: dict[tuple[str, str], tuple[float, str]] = {}
             match_details: dict[tuple[str, str], tuple[float, str, FaceRecord, Path]] = {}
+            identity_details = {}
             rejects: dict[tuple[str, str], tuple[float, str, str]] = {}
-            reviews: list[list[object]] = []
+            reviews: list[list[object]] = [
+                [a.path.stem, a.path.relative_to(photos_dir).as_posix(), "", "", "", "",
+                 a.error, "", "", "ошибка обработки"]
+                for a in sorted(failed_analyses, key=lambda a: str(a.path))
+            ]
             recovered = 0
+            identified_faces = 0
+            detected_faces = sum(len(analysis.faces) for analysis in analyses)
 
             for analysis_index, analysis in enumerate(analyses):
                 try:
@@ -1270,7 +1320,11 @@ class ChildFaceFinder:
                 per_photo_reject: dict[str, tuple[float, str, str]] = {}
                 review_for_photo: list[list[object]] = []
 
+                evaluated = []
+                recovered_faces = set()
                 for face, base_info in base_matches[analysis_index]:
+                    if self.cancel_event.is_set():
+                        raise CancelledError("Обработка отменена")
                     person_id, best_id, dist, second_id, second_dist, match_problem = base_info
                     recovered_by_anchor = False
 
@@ -1295,24 +1349,30 @@ class ChildFaceFinder:
                             second_id = expanded_second
                             second_dist = expanded_second_dist
                             match_problem = expanded_problem
-                            recovered_by_anchor = True
-                            recovered += 1
+                            recovered_faces.add(id(face))
+                    evaluated.append((face, (person_id, best_id, dist, second_id, second_dist, match_problem)))
 
+                for face, info in unique_photo_matches(evaluated, self.settings.ambiguity_margin):
+                    person_id, best_id, dist, second_id, second_dist, match_problem = info
+                    recovered_by_anchor = id(face) in recovered_faces
+                    if recovered_by_anchor and person_id is not None:
+                        recovered += 1
+                    if person_id is None or match_problem:
+                        review_for_photo.append([
+                            photo_id, relative_path, best_id,
+                            f"{dist:.4f}" if math.isfinite(dist) else "",
+                            second_id or "",
+                            "" if second_dist is None else f"{second_dist:.4f}",
+                            match_problem or "неуверенное совпадение", face.source,
+                            ",".join(str(v) for v in face.bbox),
+                            "определено, проверить" if person_id is not None else "не определено",
+                        ])
                     if person_id is None:
-                        if dist <= self.settings.match_threshold + 0.08:
-                            review_for_photo.append([
-                                photo_id,
-                                relative_path,
-                                best_id,
-                                f"{dist:.4f}",
-                                second_id or "",
-                                "" if second_dist is None else f"{second_dist:.4f}",
-                                match_problem or "неуверенное совпадение",
-                                face.source,
-                            ])
                         continue
 
+                    identified_faces += 1
                     metadata_people[analysis.path].add(person_id)
+                    identity_details[(person_id, relative_path)] = (dist, face.source, face, analysis.path)
                     match_source = "session-anchor" if recovered_by_anchor else face.source
                     if face.quality_reasons:
                         reason = "; ".join(face.quality_reasons)
@@ -1349,6 +1409,7 @@ class ChildFaceFinder:
             if recovered:
                 self.log(f"Session anchors: восстановлено пограничных совпадений: {recovered}")
 
+            self._check_cancel()
             match_rows = [
                 [person_id, Path(relative_path).stem, relative_path]
                 for (person_id, relative_path), (_dist, _source) in sorted(
@@ -1362,28 +1423,16 @@ class ChildFaceFinder:
                 )
             ]
 
-            rejected_csv = output_csv.with_name(output_csv.stem + "_rejected.csv")
-            review_csv = output_csv.with_name(output_csv.stem + "_review.csv")
-            self._write_csv_atomic(
-                output_csv,
-                ["Идентификатор цели", "номер фото с этой целью", "Исходный файл"],
-                match_rows,
-            )
-            self._write_csv_atomic(
-                rejected_csv,
-                ["Идентификатор цели", "номер фото", "Исходный файл", "Причина", "Cosine distance", "Источник"],
-                rejected_rows,
-            )
-            self._write_csv_atomic(
-                review_csv,
-                ["номер фото", "Исходный файл", "Лучший кандидат", "Distance", "Второй кандидат", "Distance 2", "Причина", "Источник"],
-                reviews,
-            )
-
+            if workflow is not None and not workflow.filter_quality:
+                match_rows = [[person, Path(relative).stem, relative]
+                              for person, relative in sorted(identity_details)]
+            rejected_csv = None
+            review_csv = None
             best_csv: Path | None = None
             best_series_count = 0
             best_photo_paths: set[Path] = set()
-            if self.settings.select_best_series:
+            best_pairs = set()
+            if select_best:
                 self.log("Серии: определение последовательных серий отдельно для каждой цели…")
                 best_candidates = [
                     BestFrameCandidate(
@@ -1399,7 +1448,8 @@ class ChildFaceFinder:
                         eye_right=face.eye_right,
                         pose=face.pose,
                     )
-                    for (person_id, relative_path), (dist, source, face, path) in match_details.items()
+                    for (person_id, relative_path), (dist, source, face, path) in
+                    (identity_details if workflow is not None and not workflow.filter_quality else match_details).items()
                 ]
                 selections = select_best_series_frames(
                     best_candidates,
@@ -1407,11 +1457,14 @@ class ChildFaceFinder:
                     eye_open_threshold=self.settings.eye_ratio_min,
                     max_gap_seconds=self.settings.series_max_gap_seconds,
                     max_filename_gap=self.settings.series_max_filename_gap,
+                    check_cancel=self._check_cancel,
                 )
+                self._check_cancel()
                 best_rows = []
                 for selection in selections:
                     candidate = selection.candidate
                     best_photo_paths.add(candidate.path)
+                    best_pairs.add((selection.person_id, candidate.relative_path))
                     eye_text = "" if selection.eye_score is None else f"{selection.eye_score:.4f}"
                     blur_text = "" if candidate.blur_score is None else f"{candidate.blur_score:.2f}"
                     best_rows.append([
@@ -1427,51 +1480,101 @@ class ChildFaceFinder:
                         f"{selection.pose_score:.4f}",
                         candidate.source,
                     ])
-                best_csv = output_csv.with_name(output_csv.stem + "_best.csv")
-                self._write_csv_atomic(
-                    best_csv,
-                    [
-                        "Идентификатор цели", "номер фото с этой целью", "Исходный файл",
-                        "Серия", "Кадров в серии", "Best score", "Cosine distance",
-                        "Резкость лица", "Открытость глаз", "Pose score", "Источник",
-                    ],
-                    best_rows,
-                )
+                if csv_enabled and details_enabled:
+                    best_csv = output_csv.with_name(output_csv.stem + "_best.csv")
+                    self._write_csv_atomic(
+                        best_csv,
+                        [
+                            "Идентификатор цели", "номер фото с этой целью", "Исходный файл",
+                            "Серия", "Кадров в серии", "Best score", "Cosine distance",
+                            "Резкость лица", "Открытость глаз", "Pose score", "Источник",
+                        ],
+                        best_rows,
+                    )
                 best_series_count = len(best_rows)
                 self.log(
-                    f"Серии: выбрано лучших кадров: {best_series_count}; CSV: {best_csv}"
+                    f"Серии: выбрано лучших кадров: {best_series_count}" + (f"; CSV: {best_csv}" if best_csv else "")
                 )
 
             xmp_written = 0
             xmp_unchanged = 0
             xmp_failed = 0
-            if self.settings.write_xmp_tags:
+            self._check_cancel()
+            if xmp_enabled:
                 people_by_photo = dict(metadata_people)
                 self.log(f"XMP: подготовлено файлов с подтверждёнными совпадениями: {len(people_by_photo)}")
                 xmp_summary = XmpMetadataWriter(log=self.log).export(
                     people_by_photo,
-                    best_photo_paths if self.settings.xmp_mark_best else set(),
+                    best_photo_paths if (workflow is not None or self.settings.xmp_mark_best) else set(),
                     all_photos=photo_paths,
+                    preserve_photos={a.path for a in failed_analyses},
+                    check_cancel=self._check_cancel,
+                    **(dict(sync_people=True, write_people=workflow.people_enabled,
+                            sync_labels=workflow.labels_enabled, best_label=workflow.best_label.strip(),
+                            legacy_best=False) if workflow is not None else {}),
                     rename_people={name.replace("Лицо_", "Ребёнок_", 1): name
                                    for name in references.person_ids if name.startswith("Лицо_")}
-                                  if references_dir is None else None,
+                                  if references_dir is None and workflow is None else None,
                 )
                 xmp_written = xmp_summary.written_files
                 xmp_unchanged = xmp_summary.unchanged_files
                 xmp_failed = xmp_summary.failed_files
                 self.log(
                     f"XMP: записано={xmp_written}; без изменений={xmp_unchanged}; "
-                    f"ошибок={xmp_failed}. Исходные изображения не изменялись."
+                    f"ошибок={xmp_failed}. Запись метаданных завершена."
                 )
 
+            if csv_enabled:
+                rows = match_rows
+                header = ["Идентификатор цели", "номер фото с этой целью", "Исходный файл"]
+                if workflow is not None:
+                    header += ["Лучший в серии для этого человека", "Замечания к качеству"]
+                    rows = [row + ["да" if (row[0], row[2]) in best_pairs else "",
+                            "; ".join(identity_details[(row[0], row[2])][2].quality_reasons)] for row in match_rows]
+                self._write_csv_atomic(output_csv, header, rows)
+                if details_enabled:
+                    rejected_csv = output_csv.with_name(output_csv.stem + "_rejected.csv")
+                    review_csv = output_csv.with_name(output_csv.stem + "_review.csv")
+                    self._write_csv_atomic(rejected_csv,
+                        ["Идентификатор цели", "номер фото", "Исходный файл", "Причина", "Cosine distance", "Источник"], rejected_rows)
+                    self._write_csv_atomic(review_csv,
+                        ["номер фото", "Исходный файл", "Лучший кандидат", "Distance", "Второй кандидат", "Distance 2", "Причина", "Источник", "Лицо (x1,y1,x2,y2)", "Статус"], reviews)
+            transfer_summary = None
+            if workflow is not None and workflow.output == 'folders':
+                output_people = defaultdict(set)
+                for person, _photo_id, relative in match_rows:
+                    output_people[photos_dir / relative].add(person)
+                blocked = set()
+                if xmp_enabled and xmp_failed:
+                    # Never move a file whose requested metadata update failed.
+                    blocked = xmp_summary.failed_photos
+                self.log('Раскладка фотографий и XMP по папкам людей…')
+                transfer_summary = export_people(output_people, photos_dir, workflow.destination,
+                    move=workflow.transfer == 'move', all_photos=photo_paths,
+                    blocked=blocked, cancel=self._check_cancel, log=self.log, progress=self.progress)
+            if reviews and review_csv is None:
+                self.log('Фотографии для проверки (CSV-отчёт выключен):')
+                for row in reviews:
+                    self.log(f"  {row[1]}: {row[6]}")
+
+        found_people = len({person for people in metadata_people.values() for person in people})
+        review_photos = len({row[1] for row in reviews})
+        self.log(f"Распознавание: людей={found_people}; лиц обнаружено={detected_faces}; "
+                 f"определено={identified_faces}; не определено={detected_faces - identified_faces}; "
+                 f"фото для проверки={review_photos}." + (f" Отчёт: {review_csv}" if review_csv else " Подробности в журнале."))
         return RunSummary(
+            detected_faces=detected_faces,
+            identified_faces=identified_faces,
+            unidentified_faces=detected_faces - identified_faces,
+            found_people=found_people,
+            review_photos=review_photos,
             reference_ids=len(references.person_ids),
             reference_files=references.file_count,
             photo_count=len(photo_paths),
             matched_pairs=len(match_rows),
             rejected_pairs=len(rejected_rows),
             review_rows=len(reviews),
-            output_csv=output_csv,
+            output_csv=output_csv if csv_enabled else None,
             rejected_csv=rejected_csv,
             review_csv=review_csv,
             best_csv=best_csv,
@@ -1479,4 +1582,10 @@ class ChildFaceFinder:
             xmp_written=xmp_written,
             xmp_unchanged=xmp_unchanged,
             xmp_failed=xmp_failed,
+            xmp_enabled=xmp_enabled,
+            file_copies=transfer_summary.copies if transfer_summary else 0,
+            file_moves=transfer_summary.moved if transfer_summary else 0,
+            file_errors=transfer_summary.failed if transfer_summary else 0,
+            destination=workflow.destination if workflow is not None and workflow.output == 'folders' else None,
+            transfer_journal=transfer_summary.journal if transfer_summary else None,
         )

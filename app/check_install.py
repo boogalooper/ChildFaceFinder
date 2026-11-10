@@ -25,6 +25,7 @@ EXPECTED = {
     "Pillow": "12.3.0",
     "pillow-heif": "1.5.0",
     "rawpy": "0.27.0",
+    "pyexiv2": "2.16.0",
 }
 
 
@@ -73,6 +74,10 @@ def main() -> int:
     root.update_idletasks()
     root.destroy()
     print("Tkinter: OK")
+
+    from embedded_xmp import self_test
+    self_test()
+    print("Embedded XMP read/write (Unicode path): OK")
 
     import cv2
     import numpy

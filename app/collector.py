@@ -4,6 +4,8 @@ import csv
 import os
 import re
 import shutil
+
+from runtime_safety import atomic_path
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -157,8 +159,10 @@ def _copy_file_cancellable(
     chunk_size: int = 1024 * 1024,
 ) -> None:
     _raise_if_cancelled(cancel_check)
+    created = False
     try:
-        with source.open("rb") as src, target.open("wb") as dst:
+        with source.open("rb") as src, target.open("xb") as dst:
+            created = True
             while True:
                 _raise_if_cancelled(cancel_check)
                 chunk = src.read(chunk_size)
@@ -169,10 +173,11 @@ def _copy_file_cancellable(
         _raise_if_cancelled(cancel_check)
         shutil.copystat(source, target)
     except BaseException:
-        try:
-            target.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if created:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise
 
 
@@ -307,10 +312,11 @@ def collect_from_csv(
             report_rows.append(["", "", "", "отменено", "сбор файлов отменён пользователем"])
 
     report_csv = destination_root / "collector_report.csv"
-    with report_csv.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.writer(handle, delimiter=";", lineterminator="\n")
-        writer.writerow(["Строка CSV", "Цель", "Исходный файл/номер", "Статус", "Результат/причина"])
-        writer.writerows(report_rows)
+    with atomic_path(report_csv) as temporary:
+        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle, delimiter=";", lineterminator="\n")
+            writer.writerow(["Строка CSV", "Цель", "Исходный файл/номер", "Статус", "Результат/причина"])
+            writer.writerows(report_rows)
 
     return CollectorSummary(
         copied=copied,

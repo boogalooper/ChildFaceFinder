@@ -62,6 +62,30 @@ LEGACY_TEMP_MIN_AGE_SECONDS = 6 * 60 * 60
 AUX_TEMP_MIN_AGE_SECONDS = 24 * 60 * 60
 
 
+def _windows_pid_is_running(pid: int, kernel32=None) -> bool:
+    from ctypes import wintypes
+    kernel32 = kernel32 if kernel32 is not None else ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetLastError.argtypes = []
+    kernel32.GetLastError.restype = wintypes.DWORD
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        # Access denied is not evidence that the owner process has exited.
+        return kernel32.GetLastError() not in (87, 1168)
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == 259
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -69,22 +93,7 @@ def _pid_is_running(pid: int) -> bool:
         return True
 
     if os.name == "nt":
-        # OpenProcess + GetExitCodeProcess avoids extra dependencies such as psutil.
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            exit_code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                # If Windows refuses the query after opening the process, be safe
-                # and consider it active rather than deleting its TEMP directory.
-                return True
-            return exit_code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
+        return _windows_pid_is_running(pid)
 
     try:
         os.kill(pid, 0)
@@ -173,7 +182,7 @@ def iter_candidate_files(folder: Path, recursive: bool = True) -> list[Path]:
             and not p.name.startswith(".")
             and p.suffix.casefold() not in SKIP_EXTENSIONS
         ),
-        key=lambda p: str(p).casefold(),
+        key=lambda p: (str(p).casefold(), str(p)),
     )
 
 

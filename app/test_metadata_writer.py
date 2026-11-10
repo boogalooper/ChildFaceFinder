@@ -34,7 +34,7 @@ def test_creates_sidecar_and_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_merges_existing_unknown_metadata(tmp_path: Path) -> None:
-    image = tmp_path / "IMG_0002.jpg"
+    image = tmp_path / "IMG_0002.CR2"
     image.write_bytes(b"jpeg")
     xmp = tmp_path / "IMG_0002.xmp"
     xmp.write_text(
@@ -88,3 +88,85 @@ def test_best_marker_is_synchronized_without_removing_people(tmp_path: Path) -> 
     assert "ChildFaceFinder|Best" not in old_h
     assert "People|Котов Никита" in old_h  # add-only person metadata is preserved
     assert "ChildFaceFinder|Best" in new_h
+
+
+def test_uppercase_sidecar_is_reused(tmp_path):
+    image = tmp_path/'photo.CR2'
+    writer = XmpMetadataWriter()
+    writer.export({image: {'Первый'}})
+    lower = image.with_suffix('.xmp')
+    upper = image.with_suffix('.XMP')
+    lower.rename(upper)
+    assert writer.export({image: {'Второй'}}).written_files == 1
+    assert set(_values(upper, f'{{{DC_NS}}}subject')) == {'Первый', 'Второй'}
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_shared_sidecar_is_not_arbitrarily_changed(tmp_path):
+    raw = tmp_path/'photo.CR2'
+    jpeg = tmp_path/'photo.NEF'
+    writer = XmpMetadataWriter()
+    writer.export({raw: {'До'}}, {raw})
+    before = raw.with_suffix('.xmp').read_bytes()
+    result = writer.export({raw: {'Один'}, jpeg: {'Другой'}}, {raw}, [raw, jpeg])
+    assert result.failed_files == 1
+    assert raw.with_suffix('.xmp').read_bytes() == before
+
+
+def test_preserve_failed_photo_metadata(tmp_path):
+    image = tmp_path/'photo.CR2'
+    writer = XmpMetadataWriter()
+    writer.export({image: {'До'}}, {image})
+    before = image.with_suffix('.xmp').read_bytes()
+    result = writer.export({}, all_photos=[image], preserve_photos={image})
+    assert result.unchanged_files == 1
+    assert image.with_suffix('.xmp').read_bytes() == before
+
+
+def test_separate_descriptions_keep_existing_keywords(tmp_path):
+    image = tmp_path/'photo.CR2'
+    xmp = image.with_suffix('.xmp')
+    xmp.write_text(f'''<rdf:RDF xmlns:rdf="{RDF_NS}" xmlns:dc="{DC_NS}" xmlns:lr="{LR_NS}">
+    <rdf:Description other="keep"/>
+    <rdf:Description><dc:subject><rdf:Bag><rdf:li>Старое</rdf:li></rdf:Bag></dc:subject></rdf:Description>
+    <rdf:Description><lr:hierarchicalSubject><rdf:Bag><rdf:li>ChildFaceFinder|Best</rdf:li></rdf:Bag></lr:hierarchicalSubject></rdf:Description>
+    </rdf:RDF>''', encoding='utf-8')
+    result = XmpMetadataWriter().export({image: {'Новое'}})
+    assert result.written_files == 1
+    root = ET.parse(xmp).getroot()
+    assert len(root.findall(f'.//{{{DC_NS}}}subject')) == 1
+    assert _values(xmp, f'{{{DC_NS}}}subject') == ['Старое', 'Новое']
+    assert 'ChildFaceFinder|Best' not in _values(xmp, f'{{{LR_NS}}}hierarchicalSubject')
+    assert root[0].get('other') == 'keep'
+
+
+def test_valid_xml_without_rdf_is_not_overwritten(tmp_path):
+    image = tmp_path/'photo.CR2'
+    xmp = image.with_suffix('.xmp')
+    before = b'<unrelated>keep</unrelated>'
+    xmp.write_bytes(before)
+    assert XmpMetadataWriter().export({image: {'Имя'}}).failed_files == 1
+    assert xmp.read_bytes() == before
+
+
+def test_external_xmp_edit_is_preserved(tmp_path, monkeypatch):
+    image = tmp_path/'photo.CR2'
+    writer = XmpMetadataWriter()
+    original = writer._write_atomic
+    def concurrent(tree, path, **kwargs):
+        path.write_bytes(b'external edit')
+        original(tree, path, **kwargs)
+    monkeypatch.setattr(writer, '_write_atomic', concurrent)
+    assert writer.export({image: {'Имя'}}).failed_files == 1
+    assert image.with_suffix('.xmp').read_bytes() == b'external edit'
+
+
+def test_export_cancellation_propagates(tmp_path):
+    import pytest
+    class Stop(Exception):
+        pass
+    def cancel():
+        raise Stop()
+    with pytest.raises(Stop):
+        XmpMetadataWriter().export({tmp_path/'photo.CR2': {'Имя'}}, check_cancel=cancel)
+    assert not list(tmp_path.glob('*.xmp'))
