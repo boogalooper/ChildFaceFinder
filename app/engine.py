@@ -19,6 +19,8 @@ import numpy as np
 
 from image_loader import cleanup_stale_temp_dirs, decode_image, iter_candidate_files, make_system_temp_dir
 from model_setup import INSIGHTFACE_ROOT, MODEL_NAME, ensure_antelopev2
+from metadata_writer import XmpMetadataWriter
+from identity_catalog import assign_identities
 from series_selector import BestFrameCandidate, select_best_series_frames
 
 cv2.setNumThreads(1)
@@ -78,6 +80,8 @@ class Settings:
     verbose_diagnostics: bool = True
 
     select_best_series: bool = False
+    write_xmp_tags: bool = False
+    xmp_mark_best: bool = False
     series_max_gap_seconds: float = 12.0
     series_max_filename_gap: int = 5
 
@@ -139,6 +143,9 @@ class RunSummary:
     review_csv: Path
     best_csv: Path | None = None
     best_series_count: int = 0
+    xmp_written: int = 0
+    xmp_unchanged: int = 0
+    xmp_failed: int = 0
 
 
 class CancelledError(RuntimeError):
@@ -1136,8 +1143,10 @@ class ChildFaceFinder:
         finally:
             temp.unlink(missing_ok=True)
 
-    def run(self, references_dir: Path, photos_dir: Path, output_csv: Path) -> RunSummary:
+    def run(self, references_dir: Path | None, photos_dir: Path, output_csv: Path) -> RunSummary:
         self.cancel_event.clear()
+        if references_dir is None and not self.settings.write_xmp_tags:
+            raise ValueError("Без эталонов необходимо включить запись XMP")
 
         removed_temp, failed_temp = cleanup_stale_temp_dirs()
         if removed_temp:
@@ -1150,7 +1159,7 @@ class ChildFaceFinder:
         with make_system_temp_dir() as temp_name:
             temp_dir = Path(temp_name)
             self.log(f"Временный каталог ОС: {temp_dir}")
-            references = self._build_references(references_dir, temp_dir)
+            references = self._build_references(references_dir, temp_dir) if references_dir is not None else None
 
             photo_paths = iter_candidate_files(photos_dir, self.settings.recursive)
             if not photo_paths:
@@ -1177,6 +1186,23 @@ class ChildFaceFinder:
             if self.cancel_event.is_set():
                 raise CancelledError("Обработка отменена")
 
+            discovered = {}
+            if references is None:
+                def check_cancel():
+                    if self.cancel_event.is_set():
+                        raise CancelledError("Обработка отменена")
+                names, vectors, discovered = assign_identities(
+                    analyses, photos_dir, self.settings.match_threshold,
+                    self.settings.ambiguity_margin, check_cancel,
+                )
+                references = ReferenceSet(
+                    person_ids=names,
+                    matrix=np.stack(vectors) if vectors else np.empty((0, 512), dtype=np.float32),
+                    ref_person_indices=np.arange(len(names), dtype=np.int32), file_count=0,
+                )
+                self.log(f"Без эталонов: каталог содержит {len(names)} ID; ChildFaceFinder_people.json")
+            metadata_people: dict[Path, set[str]] = defaultdict(set)
+
             # Первый проход matching: только исходные пользовательские эталоны.
             base_matches: dict[int, list[tuple[FaceRecord, tuple[str | None, str, float, str | None, float | None, str | None]]]] = {}
             anchor_candidates: dict[str, list[tuple[float, np.ndarray]]] = defaultdict(list)
@@ -1185,7 +1211,8 @@ class ChildFaceFinder:
             for analysis_index, analysis in enumerate(analyses):
                 rows = []
                 for face in analysis.faces:
-                    info = self._match_face(face, references)
+                    info = ((discovered[id(face)], discovered[id(face)], 0.0, None, None, None)
+                            if discovered else self._match_face(face, references))
                     rows.append((face, info))
                     person_id, _best_id, dist, _second_id, _second_dist, _problem = info
                     if (
@@ -1285,6 +1312,7 @@ class ChildFaceFinder:
                             ])
                         continue
 
+                    metadata_people[analysis.path].add(person_id)
                     match_source = "session-anchor" if recovered_by_anchor else face.source
                     if face.quality_reasons:
                         reason = "; ".join(face.quality_reasons)
@@ -1354,6 +1382,7 @@ class ChildFaceFinder:
 
             best_csv: Path | None = None
             best_series_count = 0
+            best_photo_paths: set[Path] = set()
             if self.settings.select_best_series:
                 self.log("Серии: определение последовательных серий отдельно для каждой цели…")
                 best_candidates = [
@@ -1382,6 +1411,7 @@ class ChildFaceFinder:
                 best_rows = []
                 for selection in selections:
                     candidate = selection.candidate
+                    best_photo_paths.add(candidate.path)
                     eye_text = "" if selection.eye_score is None else f"{selection.eye_score:.4f}"
                     blur_text = "" if candidate.blur_score is None else f"{candidate.blur_score:.2f}"
                     best_rows.append([
@@ -1412,6 +1442,28 @@ class ChildFaceFinder:
                     f"Серии: выбрано лучших кадров: {best_series_count}; CSV: {best_csv}"
                 )
 
+            xmp_written = 0
+            xmp_unchanged = 0
+            xmp_failed = 0
+            if self.settings.write_xmp_tags:
+                people_by_photo = dict(metadata_people)
+                self.log(f"XMP: подготовлено файлов с подтверждёнными совпадениями: {len(people_by_photo)}")
+                xmp_summary = XmpMetadataWriter(log=self.log).export(
+                    people_by_photo,
+                    best_photo_paths if self.settings.xmp_mark_best else set(),
+                    all_photos=photo_paths,
+                    rename_people={name.replace("Лицо_", "Ребёнок_", 1): name
+                                   for name in references.person_ids if name.startswith("Лицо_")}
+                                  if references_dir is None else None,
+                )
+                xmp_written = xmp_summary.written_files
+                xmp_unchanged = xmp_summary.unchanged_files
+                xmp_failed = xmp_summary.failed_files
+                self.log(
+                    f"XMP: записано={xmp_written}; без изменений={xmp_unchanged}; "
+                    f"ошибок={xmp_failed}. Исходные изображения не изменялись."
+                )
+
         return RunSummary(
             reference_ids=len(references.person_ids),
             reference_files=references.file_count,
@@ -1424,4 +1476,7 @@ class ChildFaceFinder:
             review_csv=review_csv,
             best_csv=best_csv,
             best_series_count=best_series_count,
+            xmp_written=xmp_written,
+            xmp_unchanged=xmp_unchanged,
+            xmp_failed=xmp_failed,
         )

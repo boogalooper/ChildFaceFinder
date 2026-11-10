@@ -180,6 +180,8 @@ class App(tk.Tk):
         self.require_gpu_var = tk.BooleanVar(value=bool(saved.get("require_gpu", True)))
         self.verbose_var = tk.BooleanVar(value=bool(saved.get("verbose", True)))
         self.best_series_var = tk.BooleanVar(value=bool(saved.get("select_best_series", False)))
+        self.write_xmp_var = tk.BooleanVar(value=bool(saved.get("write_xmp_tags", False)))
+        self.xmp_mark_best_var = tk.BooleanVar(value=bool(saved.get("xmp_mark_best", False)))
 
         if self.search_mode_var.get() not in SEARCH_MODES:
             self.search_mode_var.set("Улучшенный")
@@ -394,6 +396,32 @@ class App(tk.Tk):
             "Личность внутри серии не кластеризуется заново — используется уже подтверждённая цель ChildFaceFinder.",
         )
 
+        c5 = ttk.Checkbutton(
+            performance,
+            text="Записывать найденных людей в XMP sidecar",
+            variable=self.write_xmp_var,
+        )
+        c5.grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 2))
+        add_tooltip(
+            c5,
+            "После завершения анализа создаёт или дополняет .xmp рядом с исходной фотографией. "
+            "В dc:subject записываются имена подтверждённых целей, а в Lightroom hierarchicalSubject — People|Имя. "
+            "RAW/JPEG/TIFF и другие исходники никогда не изменяются. Существующие XMP-данные сохраняются. "
+            "Без эталонов назначаются постоянные ID. Брак по качеству также записывается; неуверенные совпадения с эталонами пропускаются. Ошибка XMP не отменяет CSV.",
+        )
+
+        c6 = ttk.Checkbutton(
+            performance,
+            text="Добавлять XMP-метку ChildFaceFinder|Best для лучших кадров серий",
+            variable=self.xmp_mark_best_var,
+        )
+        c6.grid(row=4, column=0, columnspan=7, sticky="w", pady=(2, 2))
+        add_tooltip(
+            c6,
+            "Если одновременно включён выбор лучших кадров серий, добавляет hierarchical keyword "
+            "ChildFaceFinder|Best выбранным кадрам. Без выбора серий эта настройка ничего не меняет.",
+        )
+
         buttons = ttk.Frame(outer)
         buttons.grid(row=7, column=0, columnspan=3, sticky="ew", pady=4)
         self.start_btn = ttk.Button(buttons, text="НАЧАТЬ АНАЛИЗ", command=self._start)
@@ -554,6 +582,8 @@ class App(tk.Tk):
         self.require_gpu_var.set(True)
         self.verbose_var.set(True)
         self.best_series_var.set(False)
+        self.write_xmp_var.set(False)
+        self.xmp_mark_best_var.set(False)
         self.status_var.set("Восстановлены рекомендуемые значения")
 
     def _settings_snapshot(self) -> dict[str, object]:
@@ -578,6 +608,8 @@ class App(tk.Tk):
             "require_gpu": self.require_gpu_var.get(),
             "verbose": self.verbose_var.get(),
             "select_best_series": self.best_series_var.get(),
+            "write_xmp_tags": self.write_xmp_var.get(),
+            "xmp_mark_best": self.xmp_mark_best_var.get(),
         }
 
     def _save_settings(self) -> None:
@@ -634,22 +666,24 @@ class App(tk.Tk):
             require_gpu=self.require_gpu_var.get(),
             verbose_diagnostics=self.verbose_var.get(),
             select_best_series=self.best_series_var.get(),
+            write_xmp_tags=self.write_xmp_var.get(),
+            xmp_mark_best=self.xmp_mark_best_var.get(),
         )
 
-    def _validate_paths(self) -> tuple[Path, Path, Path]:
+    def _validate_paths(self) -> tuple[Path | None, Path, Path]:
         ref_text = self.ref_var.get().strip()
         photos_text = self.photos_var.get().strip()
         output_text = self.output_var.get().strip()
-        if not ref_text:
-            raise ValueError("Укажите папку эталонов")
+        if not ref_text and not self.write_xmp_var.get():
+            raise ValueError("Укажите папку эталонов или включите запись лиц в метаданные")
         if not photos_text:
             raise ValueError("Укажите папку фотографий")
         if not output_text:
             raise ValueError("Укажите CSV результата")
-        refs = Path(ref_text).expanduser()
+        refs = Path(ref_text).expanduser() if ref_text else None
         photos = Path(photos_text).expanduser()
         output = Path(output_text).expanduser()
-        if not refs.is_dir():
+        if refs is not None and not refs.is_dir():
             raise ValueError("Укажите существующую папку эталонов")
         if not photos.is_dir():
             raise ValueError("Укажите существующую папку фотографий")
@@ -741,6 +775,11 @@ class App(tk.Tk):
                         f"фото: {summary.photo_count}; совпадений: {summary.matched_pairs}; "
                         f"отбраковано: {summary.rejected_pairs}; на проверку: {summary.review_rows}."
                         + (f" Лучших кадров серий: {summary.best_series_count}." if summary.best_csv is not None else "")
+                        + (
+                            f" XMP: записано {summary.xmp_written}, без изменений {summary.xmp_unchanged}, "
+                            f"ошибок {summary.xmp_failed}."
+                            if self.write_xmp_var.get() else ""
+                        )
                     )
                     self._finish_ui()
                     if not self.closing_after_cancel:
@@ -754,6 +793,11 @@ class App(tk.Tk):
                                 f"\n\nЛучшие кадры серий:\n{summary.best_csv}\n"
                                 f"Выбрано серий: {summary.best_series_count}"
                                 if summary.best_csv is not None else ""
+                            )
+                            + (
+                                f"\n\nXMP sidecar: записано {summary.xmp_written}; "
+                                f"без изменений {summary.xmp_unchanged}; ошибок {summary.xmp_failed}."
+                                if self.write_xmp_var.get() else ""
                             ),
                             parent=self,
                         )
