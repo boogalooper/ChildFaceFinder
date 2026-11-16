@@ -180,6 +180,8 @@ def iter_candidate_files(folder: Path, recursive: bool = True) -> list[Path]:
             p for p in iterator
             if p.is_file()
             and not p.name.startswith(".")
+            and not any(part.casefold() == "_face_retouch" or part.startswith(".face-retouch-")
+                        for part in p.relative_to(folder).parts[:-1])
             and p.suffix.casefold() not in SKIP_EXTENSIONS
         ),
         key=lambda p: (str(p).casefold(), str(p)),

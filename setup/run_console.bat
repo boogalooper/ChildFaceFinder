@@ -1,5 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+set "CFF_START_FOLDER=%~f1"
+if "%CFF_START_FOLDER:~-1%"=="\" set "CFF_START_FOLDER=%CFF_START_FOLDER%."
 cd /d "%~dp0.."
 title Child Face Finder console launcher
 
@@ -15,7 +17,7 @@ if not exist "%POWERSHELL_EXE%" set "POWERSHELL_EXE=powershell.exe"
 if errorlevel 1 goto :broken
 
 echo [2/2] Starting application with console diagnostics...
-"venv\Scripts\python.exe" "app\app.py"
+"venv\Scripts\python.exe" "app\app.py" "%CFF_START_FOLDER%"
 set "RC=%ERRORLEVEL%"
 echo.
 pause

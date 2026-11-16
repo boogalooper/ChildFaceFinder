@@ -3,6 +3,7 @@ from __future__ import annotations
 from workflow import WorkflowOptions
 
 import os
+import sys
 import uuid
 from datetime import datetime
 import queue
@@ -148,7 +149,7 @@ def hint(parent: tk.Widget, text: str) -> ttk.Label:
 
 
 class App(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, startup_folder: Path | None = None) -> None:
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("1000x850")
@@ -196,7 +197,8 @@ class App(tk.Tk):
         if self.quality_preset_var.get() not in QUALITY_PRESETS:
             self.quality_preset_var.set("Нормальный")
 
-        self.scenario_var = tk.StringVar(value=saved.get('scenario', 'references'))
+        saved_scenario = saved.get('scenario', 'references')
+        self.scenario_var = tk.StringVar(value='discover' if saved_scenario == 'retouch' else saved_scenario)
         self.output_mode_var = tk.StringVar(value=saved.get('output_mode', 'csv'))
         self.destination_var = tk.StringVar(value=saved.get('destination', ''))
         self.transfer_var = tk.StringVar(value=saved.get('transfer', 'copy'))
@@ -214,6 +216,12 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(value="Готово к запуску")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.collector_indeterminate = False
+
+        if startup_folder is not None:
+            if self.scenario_var.get() == 'references':
+                self.ref_var.set(str(startup_folder))
+            else:
+                self._set_photo_folder(str(startup_folder))
 
         self._build_ui()
         from theme_manager import ThemeManager
@@ -407,12 +415,15 @@ class App(tk.Tk):
     def _browse_photos(self) -> None:
         value = filedialog.askdirectory(title="Папка с фотографиями")
         if value:
-            self.photos_var.set(value)
-            if not self.output_var.get().strip():
-                self.output_var.set(str(Path(value) / "result.csv"))
-            if not self.destination_var.get().strip():
-                folder = Path(value)
-                self.destination_var.set(str(folder.parent / (folder.name + '_по_людям')))
+            self._set_photo_folder(value)
+
+    def _set_photo_folder(self, value: str) -> None:
+        self.photos_var.set(value)
+        if not self.output_var.get().strip():
+            self.output_var.set(str(Path(value) / "result.csv"))
+        if not self.destination_var.get().strip():
+            folder = Path(value)
+            self.destination_var.set(str(folder.parent / (folder.name + '_по_людям')))
 
     def _browse_output(self) -> None:
         value = filedialog.asksaveasfilename(
@@ -936,8 +947,18 @@ class App(tk.Tk):
         self.destroy()
 
 
+def folder_from_argument(arguments: list[str]) -> Path | None:
+    if not arguments or not arguments[0].strip():
+        return None
+    try:
+        path = Path(arguments[0]).expanduser()
+        return path.absolute() if path.is_dir() else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def main() -> None:
-    app = App()
+    app = App(startup_folder=folder_from_argument(sys.argv[1:]))
     app.mainloop()
 
 

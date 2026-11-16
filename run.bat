@@ -1,5 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+set "CFF_START_FOLDER=%~f1"
+if "%CFF_START_FOLDER:~-1%"=="\" set "CFF_START_FOLDER=%CFF_START_FOLDER%."
 cd /d "%~dp0"
 title Child Face Finder launcher
 
@@ -20,7 +22,7 @@ if errorlevel 1 goto :broken
 
 echo [2/3] Local Python environment OK.
 echo [3/3] Opening Child Face Finder...
-start "Child Face Finder" "venv\Scripts\pythonw.exe" "app\app.py"
+start "Child Face Finder" "venv\Scripts\pythonw.exe" "app\app.py" "%CFF_START_FOLDER%"
 if errorlevel 1 goto :launch_failed
 echo Interface launch requested. This window will close automatically.
 timeout /t 2 /nobreak >nul
